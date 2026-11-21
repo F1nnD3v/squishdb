@@ -98,6 +98,10 @@ A database lives in one `.sqdb` file with double-buffered A/B CRC32 superblocks,
 
 Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the same synthetic relational datasets:
 
+![Disk size comparison on identical rows](docs/charts/storage-comparison.svg)
+
+![Query latency and insert throughput comparison](docs/charts/speed-comparison.svg)
+
 | Benchmark | SQLite C | Parquet (Zstd L9) | SquishDB v0.4 | Comparison |
 |---|---:|---:|---:|---:|
 | GROUP BY + SUM/AVG/COUNT (100k rows) | 17.31 ms, 9.21 MB | n/a | 3.85 ms, 1.29 MB | 4.50x faster, 7.14x smaller |
