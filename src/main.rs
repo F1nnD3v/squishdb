@@ -10,7 +10,7 @@ use squishdb::{Database, DbOptions, QueryResult};
 const MAX_STREAM_ITEM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB safety cap
 
 fn print_usage() {
-    eprintln!("SquishDB v0.4 — High-efficiency lossless single-file embedded database");
+    eprintln!("SquishDB v0.4.0-alpha.1, a compressed single-file SQL database.");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  squishdb <file.sqdb>                                  Interactive SQL REPL");

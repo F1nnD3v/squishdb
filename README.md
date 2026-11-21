@@ -3,17 +3,15 @@
 [![CI](https://github.com/F1nnD3v/squishdb/actions/workflows/ci.yml/badge.svg)](https://github.com/F1nnD3v/squishdb/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **Alpha / Experimental (`v0.4.0-alpha.1`)** — On-disk format v4 (`SQSHDB04`) may still change before `1.0`. Do not rely on it yet as a drop-in production replacement for SQLite without independent backups.
+SquishDB is a single-file embedded SQL database written in Rust. It stores data in 4,096-row columnar pages and picks the smallest lossless codec for each column on each page. On our benchmark suite, database files come out 6x to 19.4x smaller than vacuumed SQLite files, and smaller than Parquet at Zstd level 9, with bit-exact round-trips for integers, IEEE-754 floats, text, and blobs.
 
-A lossless, single-file embedded relational database in Rust that **beats SQLite C on storage size (6×–19.4× smaller), analytical `GROUP BY` (4.5× faster), and indexed UUID point lookups (1.78× faster with 4.7× smaller indexes), while beating Apache Parquet Zstd-9 on disk size** — with **100% bit-exact lossless data fidelity**.
+The catch: this is `v0.4.0-alpha.1`. The on-disk format (`SQSHDB04`) can still change before 1.0, and foreign keys and multi-writer MVCC are not built yet. Keep separate backups if you put real data in it.
 
-📖 **Full documentation:** See the **[Installation & Usage Guide](docs/GUIDE.md)** for complete CLI flags, Rust library API, SQL reference, compression tuning, concurrency, and backup workflows.
+For full CLI flags, Rust API examples, SQL syntax, and tuning notes, read [docs/GUIDE.md](docs/GUIDE.md).
 
----
+## Quick start
 
-## Quick Start
-
-### Install the CLI (requires Rust 1.75+)
+Install the CLI with Rust 1.75 or newer:
 
 ```bash
 cargo install --git https://github.com/F1nnD3v/squishdb
@@ -25,13 +23,11 @@ Or build from source:
 git clone https://github.com/F1nnD3v/squishdb.git
 cd squishdb
 cargo build --release
-# Binary is at ./target/release/squishdb (or target\release\squishdb.exe on Windows)
 ```
 
-### Use from the CLI
+Run SQL from the command line:
 
 ```bash
-# Run SQL directly
 squishdb sensors.sqdb -c "
   CREATE TABLE readings (
     id INTEGER PRIMARY KEY,
@@ -43,16 +39,16 @@ squishdb sensors.sqdb -c "
   SELECT device, COUNT(*), AVG(temp) FROM readings GROUP BY device;
 "
 
-# Launch the interactive SQL REPL
+# Open the interactive REPL
 squishdb sensors.sqdb
 
-# Inspect compression ratio, page counts, indexes & cache stats
+# Print storage, compression ratio, index, and cache stats
 squishdb stats sensors.sqdb
 ```
 
-### Use as a Rust Library
+### Rust library
 
-Add SquishDB to your `Cargo.toml`:
+Add the crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -84,66 +80,68 @@ fn main() -> squishdb::types::Result<()> {
 }
 ```
 
----
+## How it works
 
-## Architecture (PAX-v4)
+A database lives in one `.sqdb` file with double-buffered A/B CRC32 superblocks, a CRC32-framed `.sqdb-wal` write-ahead log, and OS file locking (`LockFileEx` on Windows, `flock` on Unix) in [src/lock.rs](src/lock.rs).
 
-- **Single-file embedded database (`.sqdb`)**: Serverless library + standalone CLI binary, with double-buffered A/B CRC32 superblocks, CRC32-framed `.sqdb-wal`, and native OS-level shared/exclusive locking (`LockFileEx` on Windows, `flock` on Unix) via [src/lock.rs](src/lock.rs).
-- **Per-Column Independently Compressed PAX-v4 Pages** ([src/pax.rs](src/pax.rs), [src/storage.rs](src/storage.rs)):
-  - 4,096-row PAX pages with a CRC32-verified chunk offset table + independently compressed column chunks — giving **true disk-level columnar projection** (untouched columns have zero disk read, zero CRC32, and zero decompression).
-- **Automatic Type-Aware Lossless Codecs** ([src/encoding.rs](src/encoding.rs)):
-  - **INTEGER (`i64`):** `Constant`, `FOR + Bitpack`, `Delta + ZigZag + Bitpack`, `Delta + Varint`, `RLE`, `Dictionary + Bitpack`, `Raw`, plus zero-duplicate `INTEGER PRIMARY KEY` rowid aliasing.
-  - **REAL (`f64`):** Bit-exact `Constant`, `ScaledDecimal` (IEEE-754 `.to_bits()` round-trip verified), 8-lane `ByteShuffle`, `Raw`.
-  - **TEXT / BLOB:** `Constant`, lexicographically sorted **Front-Coded Dictionary**, split-length `Raw`.
-- **Dictionary-Native Vectorized Execution** ([src/vector.rs](src/vector.rs)):
-  - Decodes dictionary-encoded text columns directly into `{ dict, codes }` with zero per-row `String` allocations, filters via single integer code comparison, and aggregates `GROUP BY` into L1-cache-resident flat arrays indexed by dictionary code.
-- **Demand-Paged SSTable Secondary Indexes & Per-Column Cache** ([src/index.rs](src/index.rs), [src/cache.rs](src/cache.rs)):
-  - 4,096-entry delta-encoded compressed leaf blocks on disk + sparse Catalog directory + LRU `IndexBlockCache` + per-column `PageCache`, plus automatic 6-bit/key per-page Bloom filters.
-- **Rich SQL Engine & Atomic Backups** ([src/sql.rs](src/sql.rs)):
-  - CTEs (`WITH`), subqueries (`FROM`, `IN`), window functions (`ROW_NUMBER()`, `RANK()`, `SUM`/`AVG`/`COUNT` `OVER`), Hash `INNER`/`LEFT JOIN`, `GROUP BY`/`HAVING`, `UNIQUE`/`DEFAULT`, O(1) `ALTER TABLE ADD COLUMN`, `CLUSTER BY`, `VACUUM [SORT BY ...]`, `BACKUP TO 'path'`, and `EXPLAIN`.
+**PAX-v4 columnar pages.** Each 4,096-row page stores a CRC32-verified chunk offset table followed by independently compressed column chunks in [src/pax.rs](src/pax.rs) and [src/storage.rs](src/storage.rs). Queries only read, verify, and decompress the columns they touch.
 
-## Measured Benchmark Summary (SquishDB v0.4 vs SQLite C & Apache Parquet)
+**Per-column lossless codecs.** The encoder in [src/encoding.rs](src/encoding.rs) tries codecs per column and keeps the smallest output. Integers use Constant, FOR + Bitpack, Delta + ZigZag + Bitpack, Delta + Varint, RLE, Dictionary + Bitpack, or Raw, and `INTEGER PRIMARY KEY` aliases `rowid` for zero duplicate bytes. Floats use Constant, ScaledDecimal verified bit-for-bit via `.to_bits()`, 8-lane ByteShuffle, or Raw. Text and blobs use Constant, lexicographically sorted front-coded dictionaries, or split-length Raw.
 
-| Benchmark | SQLite C (VACUUMed) | Apache Parquet (Zstd L9) | SquishDB v0.4 | Speedup / Savings |
+**Dictionary-native vectorized `GROUP BY`.** For single-table aggregations, [src/vector.rs](src/vector.rs) decodes dictionary-encoded text straight into `{ dict, codes }` without allocating per-row `String` values, filters on integer codes, and aggregates into flat arrays indexed by code.
+
+**Demand-paged secondary indexes.** Indexes in [src/index.rs](src/index.rs) write 4,096-entry delta-encoded compressed leaf blocks on disk with a sparse directory in the catalog, an LRU block cache in [src/cache.rs](src/cache.rs), and automatic 6-bit-per-key per-page Bloom filters.
+
+**SQL engine.** [src/sql.rs](src/sql.rs) implements `WITH` CTEs, `FROM` and `IN` subqueries, window functions (`ROW_NUMBER()`, `RANK()`, `SUM`/`AVG`/`COUNT` `OVER`), hash `INNER` and `LEFT JOIN`, `GROUP BY`/`HAVING`, `UNIQUE`, `DEFAULT`, O(1) `ALTER TABLE ADD COLUMN`, `CLUSTER BY`, `VACUUM [SORT BY ...]`, `BACKUP TO`, and `EXPLAIN`.
+
+## Benchmarks
+
+Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the same synthetic relational datasets:
+
+| Benchmark | SQLite C | Parquet (Zstd L9) | SquishDB v0.4 | Comparison |
 |---|---:|---:|---:|---:|
-| **GROUP BY + SUM/AVG/COUNT (100k rows)** | 17.31 ms (9.21 MB) | — | **3.85 ms (1.29 MB)** | **4.50× faster & 7.14× smaller** |
-| **200 Random UUID Lookups (40k rows, indexed)** | 23.34 ms (4.64 MB) | — | **13.14 ms (1.89 MB)** | **1.78× faster & 2.46× smaller** |
-| **UUID Index Disk Overhead (40k rows)** | +1,752 KB | — | **+375 KB** | **4.7× smaller index** |
-| **Multi-Device IoT Clustered (150k rows)** | 7.82 MB | 1.50 MB | **0.40 MB** | **19.44× smaller vs SQLite (3.75× vs Parquet)** |
-| **JSON Telemetry Logs (80k rows)** | 14.81 MB | 1.47 MB | **1.05 MB** | **14.10× smaller vs SQLite** |
-| **Random 4 KB Blobs (Entropy Limit)** | 8.80 MB | 7.85 MB | **7.81 MB** | **Zero inflation (+0.57 B/row)** |
+| GROUP BY + SUM/AVG/COUNT (100k rows) | 17.31 ms, 9.21 MB | n/a | 3.85 ms, 1.29 MB | 4.50x faster, 7.14x smaller |
+| 200 random UUID lookups (40k rows, indexed) | 23.34 ms, 4.64 MB | n/a | 13.14 ms, 1.89 MB | 1.78x faster, 2.46x smaller |
+| UUID index disk overhead (40k rows) | +1,752 KB | n/a | +375 KB | 4.7x smaller index |
+| Multi-device IoT clustered (150k rows) | 7.82 MB | 1.50 MB | 0.40 MB | 19.44x smaller than SQLite, 3.75x smaller than Parquet |
+| JSON telemetry logs (80k rows) | 14.81 MB | 1.47 MB | 1.05 MB | 14.10x smaller than SQLite |
+| Random 4 KB blobs (incompressible) | 8.80 MB | 7.85 MB | 7.81 MB | +0.57 B/row overhead |
 
-### Insert Throughput (Release Mode)
-- Single-row auto-commit (`sync_wal = true`, `fsync` every row): **973 rows/sec**
-- Single-row auto-commit (`sync_wal = false`, WAL buffered): **119,181 rows/sec**
-- Batched WAL transaction (`1,000 rows/COMMIT`, `sync_wal = true`): **363,416 rows/sec**
-- Bulk PAX-v4 load + Brotli checkpoint (`50,000 rows`): **2,088,886 rows/sec**
+### Insert throughput
+
+Measured in release mode:
+
+- Single-row auto-commit with `sync_wal = true` (fsync per row): 973 rows/sec.
+- Single-row auto-commit with `sync_wal = false` (buffered WAL): 119,181 rows/sec.
+- Batched WAL transaction at 1,000 rows per `COMMIT` with `sync_wal = true`: 363,416 rows/sec.
+- Direct bulk PAX-v4 load plus Brotli checkpoint over 50,000 rows: 2,088,886 rows/sec.
+
+Single-row fsynced writes are bound by disk fsync latency, so wrap bulk writes in `BEGIN` / `COMMIT` or call `insert_batch` / `bulk_insert`.
 
 ## Backups
 
+Run an online atomic backup from SQL:
+
 ```sql
--- Atomic online backup (checkpoints WAL first, writes via temp file + atomic rename)
 BACKUP TO 'backup.sqdb';
 ```
 
-Or run `CHECKPOINT;` (or close the DB) and copy the single `.sqdb` file directly.
+This checkpoints the WAL, writes a temporary copy, calls `sync_all`, and atomically replaces the target file. You can also run `CHECKPOINT;`, close the writer, and copy the `.sqdb` file directly.
 
-## Current Limitations & Roadmap (Pre-1.0)
+## What is missing before 1.0
 
-Not yet implemented (planned before `1.0`):
-- **Foreign keys & `CHECK` constraints** (`REFERENCES ... ON DELETE CASCADE`)
-- **Nested `SAVEPOINT`s** and multi-writer **MVCC** snapshot isolation (currently concurrent shared readers + single exclusive writer)
-- **Direct `.sqlite` → `.sqdb` CLI migration tool** (`squishdb import-sqlite`)
-- **Composite multi-column secondary indexes** and range-query B-tree indexes
-- **Backward-compatible format migration guarantees** across major format versions
+- Foreign keys and `CHECK` constraints.
+- Nested `SAVEPOINT`s and multi-writer MVCC (today SquishDB allows concurrent shared readers or one exclusive writer).
+- A direct `.sqlite` to `.sqdb` migration command.
+- Composite multi-column indexes and range B-tree indexes.
+- Guaranteed forward migration across on-disk format versions.
 
-## Testing & Benchmarks
+## Running tests and benchmarks
 
 ```bash
-# Run the full test suite (integration, fuzz/crash, adversarial & audit regressions)
 cargo test --release
 
-# Run head-to-head SQLite & Parquet benchmarks (requires Python 3; optional pyarrow for Parquet)
+# Head-to-head SQLite and Parquet benchmarks (Python 3; optional pyarrow for Parquet)
 python3 benchmarks/compare_sqlite.py balanced
 python3 benchmarks/compare_industry.py
 python3 benchmarks/bench_v2.py
@@ -151,4 +149,4 @@ python3 benchmarks/bench_v2.py
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
