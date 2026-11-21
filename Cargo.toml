@@ -1,0 +1,20 @@
+[package]
+name = "squishdb"
+version = "0.4.0-alpha.1"
+edition = "2021"
+license = "MIT"
+description = "A lossless, high-efficiency single-file embedded relational database using PAX columnar pages, type-aware encodings, and adaptive compression."
+repository = "https://github.com/F1nnD3v/squishdb"
+readme = "README.md"
+keywords = ["database", "embedded", "sql", "compression", "columnar"]
+categories = ["database-implementations", "compression"]
+
+[dependencies]
+brotli = { version = "9.0.0", default-features = false, features = ["std"] }
+crc32fast = "1.5.2"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
