@@ -1,0 +1,32 @@
+{
+  "name": "squishdb",
+  "version": "0.4.0-alpha.1",
+  "description": "TypeScript and JavaScript bindings for SquishDB (Node.js, Bun, and Deno).",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/squishdb.test.mjs"
+  },
+  "optionalDependencies": {
+    "koffi": "^2.9.0"
+  },
+  "keywords": [
+    "database",
+    "embedded",
+    "sql",
+    "compression",
+    "columnar",
+    "squishdb"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

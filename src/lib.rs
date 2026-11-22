@@ -1,8 +1,10 @@
 pub mod cache;
 pub mod encoding;
+pub mod ffi;
 pub mod index;
 pub mod lock;
 pub mod pax;
+pub mod rpc;
 pub mod sql;
 pub mod storage;
 pub mod types;
@@ -19,7 +21,7 @@ use crate::lock::{atomic_replace_file, OsFileLock};
 use crate::pax::{CompressionProfile, DEFAULT_PAGE_ROWS};
 use crate::sql::{
     eval_bool_fast, eval_expr, execute_statement, extract_index_candidates, page_might_match,
-    parse_sql, EvalSchema, Expr,
+    parse_sql, parse_sql_with_params, EvalSchema, Expr,
 };
 use crate::storage::{Catalog, StorageFile, TableEntry};
 use crate::types::{ColumnDef, Error, Result, Row, TableSchema, Value};
@@ -146,6 +148,71 @@ impl DbStats {
                 cluster
             ));
         }
+        s
+    }
+
+    pub fn to_json(&self) -> String {
+        fn esc(s: &str) -> String {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for ch in s.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+        let mut s = format!(
+            "{{\"db_file_bytes\":{},\"wal_file_bytes\":{},\"catalog_stored_bytes\":{},\"catalog_raw_bytes\":{},\"generation\":{},\"index_count\":{},\"index_disk_bytes\":{},\"cache_hits\":{},\"cache_misses\":{},\"index_cache_hits\":{},\"index_cache_misses\":{},\"read_only\":{},\"tables\":[",
+            self.db_file_bytes,
+            self.wal_file_bytes,
+            self.catalog_stored_bytes,
+            self.catalog_raw_bytes,
+            self.generation,
+            self.index_count,
+            self.index_disk_bytes,
+            self.cache_hits,
+            self.cache_misses,
+            self.index_cache_hits,
+            self.index_cache_misses,
+            self.read_only
+        );
+        for (i, t) in self.tables.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let ratio = if t.stored_pax_bytes > 0 {
+                (t.raw_pax_bytes as f64) / (t.stored_pax_bytes as f64)
+            } else {
+                1.0
+            };
+            s.push_str(&format!(
+                "{{\"name\":{},\"live_rows\":{},\"deleted_slots\":{},\"hot_buffer_rows\":{},\"page_count\":{},\"raw_pax_bytes\":{},\"stored_pax_bytes\":{},\"compression_ratio\":{:.4},\"cluster_by\":[",
+                esc(&t.name),
+                t.live_rows,
+                t.deleted_slots,
+                t.hot_buffer_rows,
+                t.page_count,
+                t.raw_pax_bytes,
+                t.stored_pax_bytes,
+                ratio
+            ));
+            for (j, cb) in t.cluster_by.iter().enumerate() {
+                if j > 0 {
+                    s.push(',');
+                }
+                s.push_str(&esc(cb));
+            }
+            s.push_str("]}");
+        }
+        s.push_str("]}");
         s
     }
 }
@@ -409,6 +476,17 @@ impl Database {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         let stmts = parse_sql(sql)?;
+        let mut results = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            results.push(execute_statement(self, stmt)?);
+        }
+        Ok(results)
+    }
+
+    /// Execute one or more SQL statements with positional (`?`) or numbered (`$1`, `$2`, ...)
+    /// bound parameters. Values are injected directly into the AST without string interpolation.
+    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<QueryResult>> {
+        let stmts = parse_sql_with_params(sql, params)?;
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             results.push(execute_statement(self, stmt)?);

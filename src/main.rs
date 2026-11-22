@@ -19,6 +19,8 @@ fn print_usage() {
     eprintln!("  squishdb import-bin <file.sqdb> [profile] [col1,col2] Bulk import (+ optional cluster keys)");
     eprintln!("  squishdb export-bin <file.sqdb> <table>               Exact lossless binary export");
     eprintln!("  squishdb bench-lookup <file.sqdb> < queries.sql       Measure query latency from stdin");
+    eprintln!("  squishdb rpc <file.sqdb> [--readonly] [--profile P] [--sync-wal]");
+    eprintln!("                                                        Persistent JSON-RPC over stdio");
     eprintln!();
     eprintln!("Profiles: fast | balanced (default) | max | none");
 }
@@ -401,6 +403,34 @@ fn main() {
                 std::process::exit(1);
             }
             run_bench_lookup(Path::new(&args[2]))
+        }
+        "rpc" => {
+            if args.len() < 3 {
+                print_usage();
+                std::process::exit(1);
+            }
+            let db_path = &args[2];
+            let mut readonly = false;
+            let mut opts = DbOptions::default();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--readonly" => readonly = true,
+                    "--sync-wal" => opts.sync_wal = true,
+                    "--profile" if i + 1 < args.len() => {
+                        opts.compression = parse_profile(&args[i + 1]);
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let db_res = if readonly {
+                Database::open_readonly(db_path)
+            } else {
+                Database::open_with_options(db_path, opts)
+            };
+            db_res.and_then(squishdb::rpc::run_rpc_loop)
         }
         "-h" | "--help" | "help" => {
             print_usage();

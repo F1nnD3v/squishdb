@@ -21,3 +21,18 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+
+# Language binding build artifacts
+*.egg-info/
+bindings/typescript/node_modules/
+bindings/java/out/
+*.class
+bindings/csharp/*/bin/
+bindings/csharp/*/obj/
+bindings/c/example
+bindings/c/example.exe
+bindings/cpp/example
+bindings/cpp/example.exe
+*.obj
+*.exp
+*.ilk

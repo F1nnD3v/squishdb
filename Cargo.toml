@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["database", "embedded", "sql", "compression", "columnar"]
 categories = ["database-implementations", "compression"]
 
+[lib]
+name = "squishdb"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 brotli = { version = "9.0.0", default-features = false, features = ["std"] }
 crc32fast = "1.5.2"

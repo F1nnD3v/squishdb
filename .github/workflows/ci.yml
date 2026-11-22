@@ -65,3 +65,69 @@ jobs:
 
       - name: Run lossless SQLite comparison benchmark
         run: python3 benchmarks/compare_sqlite.py balanced
+
+  bindings:
+    name: Multi-language Bindings (Linux)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build release binary and shared library
+        run: cargo build --release
+
+      - name: Test C and C++17 bindings
+        run: |
+          cc -O2 -Iinclude bindings/c/example.c -Ltarget/release -lsquishdb -Wl,-rpath,$PWD/target/release -o /tmp/squishdb_c_test
+          /tmp/squishdb_c_test /tmp/c_test.sqdb
+          c++ -std=c++17 -O2 -Iinclude bindings/cpp/example.cpp -Ltarget/release -lsquishdb -Wl,-rpath,$PWD/target/release -o /tmp/squishdb_cpp_test
+          /tmp/squishdb_cpp_test /tmp/cpp_test.sqdb
+
+      - name: Test Python bindings
+        run: PYTHONPATH=bindings/python python3 -m unittest discover -s bindings/python/tests -v
+
+      - name: Test TypeScript / Node.js bindings
+        run: node --test bindings/typescript/test/squishdb.test.mjs
+
+      - name: Test Java FFM bindings
+        run: |
+          mkdir -p /tmp/squishdb-java-out
+          javac -d /tmp/squishdb-java-out bindings/java/src/com/squishdb/SquishDb.java bindings/java/test/SquishDbTest.java
+          java --enable-native-access=ALL-UNNAMED -cp /tmp/squishdb-java-out SquishDbTest
+
+      - name: Test C# / .NET bindings
+        run: dotnet run --project bindings/csharp/SquishDb.Tests
+
+      - name: Test Go cgo bindings
+        working-directory: bindings/go
+        run: go test -v ./...

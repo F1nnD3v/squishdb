@@ -239,6 +239,8 @@ enum Token {
     Le,
     Gt,
     Ge,
+    Question,
+    DollarParam(usize),
     Eof,
 }
 
@@ -299,6 +301,24 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             b'=' => {
                 tokens.push(Token::Eq);
                 i += 1;
+            }
+            b'?' => {
+                tokens.push(Token::Question);
+                i += 1;
+            }
+            b'$' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let idx: usize = input[start..i]
+                    .parse()
+                    .map_err(|_| Error::Sql(format!("Invalid parameter index: ${}", &input[start..i])))?;
+                if idx == 0 {
+                    return Err(Error::Sql("Parameter index $0 is invalid; parameters are 1-based".into()));
+                }
+                tokens.push(Token::DollarParam(idx));
             }
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
                 tokens.push(Token::Ne);
@@ -469,14 +489,62 @@ const CLAUSE_KEYWORDS: &[&str] = &[
     "WITH",
 ];
 
-struct Parser {
+struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
+    params: &'a [Value],
+    next_param: usize,
+    used_params: Vec<bool>,
 }
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+impl<'a> Parser<'a> {
+    fn new(tokens: Vec<Token>, params: &'a [Value]) -> Self {
+        let n = params.len();
+        Parser {
+            tokens,
+            pos: 0,
+            params,
+            next_param: 0,
+            used_params: vec![false; n],
+        }
+    }
+
+    fn bind_next_param(&mut self) -> Result<Value> {
+        let idx = self.next_param;
+        if idx >= self.params.len() {
+            return Err(Error::Sql(format!(
+                "Missing SQL parameter at position {} (only {} provided)",
+                idx + 1,
+                self.params.len()
+            )));
+        }
+        self.next_param += 1;
+        self.used_params[idx] = true;
+        Ok(self.params[idx].clone())
+    }
+
+    fn bind_numbered_param(&mut self, one_based: usize) -> Result<Value> {
+        let idx = one_based - 1;
+        if idx >= self.params.len() {
+            return Err(Error::Sql(format!(
+                "Missing SQL parameter ${} (only {} provided)",
+                one_based,
+                self.params.len()
+            )));
+        }
+        self.used_params[idx] = true;
+        Ok(self.params[idx].clone())
+    }
+
+    fn verify_all_params_used(&self) -> Result<()> {
+        if let Some(unused_idx) = self.used_params.iter().position(|&u| !u) {
+            return Err(Error::Sql(format!(
+                "Unused SQL parameter at position {} ({} provided)",
+                unused_idx + 1,
+                self.params.len()
+            )));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -1080,6 +1148,22 @@ impl Parser {
                         .map_err(|_| Error::Sql(format!("LIMIT out of range: {}", n)))?;
                     Some(v)
                 }
+                Token::Question => match self.bind_next_param()? {
+                    Value::Integer(n) if n >= 0 => {
+                        let v = usize::try_from(n)
+                            .map_err(|_| Error::Sql(format!("LIMIT out of range: {}", n)))?;
+                        Some(v)
+                    }
+                    other => return Err(Error::Sql(format!("Invalid LIMIT parameter: {:?}", other))),
+                },
+                Token::DollarParam(idx) => match self.bind_numbered_param(idx)? {
+                    Value::Integer(n) if n >= 0 => {
+                        let v = usize::try_from(n)
+                            .map_err(|_| Error::Sql(format!("LIMIT out of range: {}", n)))?;
+                        Some(v)
+                    }
+                    other => return Err(Error::Sql(format!("Invalid LIMIT parameter: {:?}", other))),
+                },
                 other => return Err(Error::Sql(format!("Invalid LIMIT: {:?}", other))),
             }
         } else {
@@ -1093,6 +1177,22 @@ impl Parser {
                         .map_err(|_| Error::Sql(format!("OFFSET out of range: {}", n)))?;
                     Some(v)
                 }
+                Token::Question => match self.bind_next_param()? {
+                    Value::Integer(n) if n >= 0 => {
+                        let v = usize::try_from(n)
+                            .map_err(|_| Error::Sql(format!("OFFSET out of range: {}", n)))?;
+                        Some(v)
+                    }
+                    other => return Err(Error::Sql(format!("Invalid OFFSET parameter: {:?}", other))),
+                },
+                Token::DollarParam(idx) => match self.bind_numbered_param(idx)? {
+                    Value::Integer(n) if n >= 0 => {
+                        let v = usize::try_from(n)
+                            .map_err(|_| Error::Sql(format!("OFFSET out of range: {}", n)))?;
+                        Some(v)
+                    }
+                    other => return Err(Error::Sql(format!("Invalid OFFSET parameter: {:?}", other))),
+                },
                 other => return Err(Error::Sql(format!("Invalid OFFSET: {:?}", other))),
             }
         } else {
@@ -1313,6 +1413,8 @@ impl Parser {
             Token::Float(v) => Ok(Expr::Literal(Value::Real(v))),
             Token::Str(s) => Ok(Expr::Literal(Value::Text(s))),
             Token::Blob(b) => Ok(Expr::Literal(Value::Blob(b))),
+            Token::Question => Ok(Expr::Literal(self.bind_next_param()?)),
+            Token::DollarParam(idx) => Ok(Expr::Literal(self.bind_numbered_param(idx)?)),
             Token::Minus => {
                 if let Token::UInt(v) = self.peek().clone() {
                     self.next();
@@ -1445,9 +1547,15 @@ impl Parser {
 }
 
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
+    parse_sql_with_params(sql, &[])
+}
+
+pub fn parse_sql_with_params(sql: &str, params: &[Value]) -> Result<Vec<Statement>> {
     let tokens = tokenize(sql)?;
-    let mut parser = Parser::new(tokens);
-    parser.parse_statements()
+    let mut parser = Parser::new(tokens, params);
+    let stmts = parser.parse_statements()?;
+    parser.verify_all_params_used()?;
+    Ok(stmts)
 }
 
 // ============================================================================

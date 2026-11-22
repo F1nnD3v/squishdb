@@ -7,7 +7,7 @@ SquishDB is a single-file embedded SQL database written in Rust. It stores data 
 
 The catch: this is `v0.4.0-alpha.1`. The on-disk format (`SQSHDB04`) can still change before 1.0, and foreign keys and multi-writer MVCC are not built yet. Keep separate backups if you put real data in it.
 
-For full CLI flags, Rust API examples, SQL syntax, and tuning notes, read [docs/GUIDE.md](docs/GUIDE.md).
+For full CLI flags, Rust API examples, SQL syntax, and tuning notes, read [docs/GUIDE.md](docs/GUIDE.md). For using SquishDB from Python, TypeScript/JavaScript, Java/Kotlin, C#/.NET, Go, C, C++, and other languages, read [docs/BINDINGS.md](docs/BINDINGS.md).
 
 ## Quick start
 
@@ -79,6 +79,20 @@ fn main() -> squishdb::types::Result<()> {
     Ok(())
 }
 ```
+
+### Other languages (Python, TypeScript/JS, Java/Kotlin, C#, Go, C/C++)
+
+`cargo build --release` builds both the CLI binary and the native C ABI library (`squishdb.dll`, `libsquishdb.so`, `libsquishdb.dylib`) with parameterized SQL (`?` and `$1`) and bulk PAX ingestion. Ready-to-use bindings live under `include/` and `bindings/`:
+
+- **Python** (`bindings/python/`): zero-dependency `ctypes` package with PEP 249 DB-API 2.0 (`connect`, `cursor`, `execute`, `bulk_insert`).
+- **TypeScript / JavaScript** (`bindings/typescript/`): zero-dependency Node.js / Bun / Deno client with `.d.ts` types over persistent `squishdb rpc`.
+- **Java & Kotlin** (`bindings/java/`): zero-dependency Java 22+ Foreign Function & Memory (`java.lang.foreign`) binding.
+- **C# / .NET** (`bindings/csharp/`): zero-dependency P/Invoke library targeting `.NET 8+`.
+- **Go** (`bindings/go/`): `cgo` package linking directly against `include/squishdb.h`.
+- **C & C++17** (`include/squishdb.h`, `include/squishdb.hpp`): C99 API and header-only RAII C++17 wrapper.
+- **Any other language** (PHP, Ruby, Swift, Dart, Zig, etc.): call `libsquishdb` via FFI or connect to `squishdb rpc <file.sqdb>` (newline-delimited JSON-RPC over stdio).
+
+See [docs/BINDINGS.md](docs/BINDINGS.md) for install commands and examples in each language.
 
 ## How it works
 
