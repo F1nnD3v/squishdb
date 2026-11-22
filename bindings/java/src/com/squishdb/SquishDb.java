@@ -328,7 +328,7 @@ public final class SquishDb implements AutoCloseable {
                 throw new SquishException(lastError());
             }
             return extractResults(arena, resPtr);
-        } catch (SquishException e) {
+        } catch (SquishException | IllegalArgumentException e) {
             throw e;
         } catch (Throwable t) {
             throw new SquishException("execute failed: " + t.getMessage());
@@ -382,7 +382,7 @@ public final class SquishDb implements AutoCloseable {
             } finally {
                 MH_BATCH_FREE.invokeExact(batch);
             }
-        } catch (SquishException e) {
+        } catch (SquishException | IllegalArgumentException e) {
             throw e;
         } catch (Throwable t) {
             throw new SquishException("batch insert failed: " + t.getMessage());
