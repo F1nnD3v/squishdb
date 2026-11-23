@@ -176,6 +176,16 @@ pub enum Statement {
         check_constraints: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKeyDef>,
     },
+    AlterDropColumn {
+        table: String,
+        column: String,
+        if_exists: bool,
+    },
+    AlterRenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
     DropTable {
         if_exists: bool,
         name: String,
@@ -1041,6 +1051,31 @@ impl<'a> Parser<'a> {
                     column,
                     check_constraints,
                     foreign_keys,
+                });
+            }
+            if self.eat_kw("DROP") {
+                let _ = self.eat_kw("COLUMN");
+                let mut if_exists = false;
+                if self.eat_kw("IF") {
+                    self.expect_kw("EXISTS")?;
+                    if_exists = true;
+                }
+                let column = self.expect_ident()?;
+                return Ok(Statement::AlterDropColumn {
+                    table,
+                    column,
+                    if_exists,
+                });
+            }
+            if self.eat_kw("RENAME") {
+                let _ = self.eat_kw("COLUMN");
+                let old_name = self.expect_ident()?;
+                self.expect_kw("TO")?;
+                let new_name = self.expect_ident()?;
+                return Ok(Statement::AlterRenameColumn {
+                    table,
+                    old_name,
+                    new_name,
                 });
             }
             self.expect_kw("CLUSTER")?;
@@ -1984,6 +2019,56 @@ pub fn format_expr(expr: &Expr) -> Result<String> {
         Expr::Window { .. } => Err(Error::Sql(
             "Window functions are not allowed in CHECK constraints".into(),
         )),
+    }
+}
+
+/// Rewrites column references matching `old_name` (unqualified or qualified with `table_name`)
+/// inside an `Expr` AST to `new_name` (used by `ALTER TABLE RENAME COLUMN` on CHECK constraints).
+pub fn rename_column_in_expr(expr: &mut Expr, table_name: &str, old_name: &str, new_name: &str) {
+    match expr {
+        Expr::Literal(_) => {}
+        Expr::Column { table, name } => {
+            let tbl_ok = match table {
+                None => true,
+                Some(t) => t.eq_ignore_ascii_case(table_name),
+            };
+            if tbl_ok && name.eq_ignore_ascii_case(old_name) {
+                *name = new_name.to_string();
+            }
+        }
+        Expr::UnaryNot(e) | Expr::UnaryNeg(e) | Expr::IsNull { expr: e, .. } => {
+            rename_column_in_expr(e, table_name, old_name, new_name);
+        }
+        Expr::Binary { left, right, .. } => {
+            rename_column_in_expr(left, table_name, old_name, new_name);
+            rename_column_in_expr(right, table_name, old_name, new_name);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_column_in_expr(expr, table_name, old_name, new_name);
+            rename_column_in_expr(low, table_name, old_name, new_name);
+            rename_column_in_expr(high, table_name, old_name, new_name);
+        }
+        Expr::InList { expr, list, .. } => {
+            rename_column_in_expr(expr, table_name, old_name, new_name);
+            for item in list {
+                rename_column_in_expr(item, table_name, old_name, new_name);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (c, v) in whens {
+                rename_column_in_expr(c, table_name, old_name, new_name);
+                rename_column_in_expr(v, table_name, old_name, new_name);
+            }
+            if let Some(e) = else_expr {
+                rename_column_in_expr(e, table_name, old_name, new_name);
+            }
+        }
+        Expr::InSubquery { expr, .. } => {
+            rename_column_in_expr(expr, table_name, old_name, new_name);
+        }
+        Expr::Aggregate(_) | Expr::Window { .. } => {}
     }
 }
 
@@ -3254,38 +3339,40 @@ fn compile_vec_filter(expr: &Expr, schema: &TableSchema, base_alias: &str) -> Op
     }
 }
 
-/// Attempts to run a single-table GROUP BY query through the zero-transposition vectorized batch engine!
+#[derive(Debug, Clone, Copy)]
+enum VecSelectItem {
+    GroupCol(usize),
+    Agg(usize),
+}
+
+/// Attempts to run a single-table GROUP BY query (0, 1, or N group columns) through the
+/// zero-transposition parallel vectorized batch engine.
 fn try_vectorized_group_by(
     db: &mut Database,
     sel: &SelectStmt,
     base_schema: &TableSchema,
     base_alias: &str,
 ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>, String)>> {
-    if !sel.joins.is_empty() || sel.group_by.len() > 1 {
+    if !sel.joins.is_empty() {
         return Ok(None);
     }
 
-    // Group column must be None (global) or a single Text/Int column
-    let group_col = if sel.group_by.is_empty() {
-        None
-    } else if let Expr::Column { table, name } = &sel.group_by[0] {
-        if !alias_matches(table, base_alias) {
+    // Collect 0, 1, or N group-by column indices on `base_schema`.
+    let mut group_cols: Vec<usize> = Vec::with_capacity(sel.group_by.len());
+    for gexpr in &sel.group_by {
+        if let Expr::Column { table, name } = gexpr {
+            if !alias_matches(table, base_alias) {
+                return Ok(None);
+            }
+            let ci = match base_schema.col_index(name) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            group_cols.push(ci);
+        } else {
             return Ok(None);
         }
-        let ci = match base_schema.col_index(name) {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-        if !matches!(
-            base_schema.columns[ci].col_type,
-            ColumnType::Text | ColumnType::Integer
-        ) {
-            return Ok(None);
-        }
-        Some(ci)
-    } else {
-        return Ok(None);
-    };
+    }
 
     // Optional WHERE must compile cleanly to VecFilter
     let vec_filter = match &sel.where_clause {
@@ -3296,13 +3383,13 @@ fn try_vectorized_group_by(
         },
     };
 
-    // Every SELECT item must be either the group_by column or a supported direct aggregate
+    // Every SELECT item must be either one of the group_by columns or a supported direct aggregate
     let mut agg_kinds: Vec<VecAggKind> = Vec::new();
-    let mut item_plan: Vec<Option<usize>> = Vec::new(); // None = group key, Some(agg_idx)
+    let mut item_plan: Vec<VecSelectItem> = Vec::new();
     let mut out_cols = Vec::new();
     let mut needed = vec![false; base_schema.columns.len()];
 
-    if let Some(gc) = group_col {
+    for &gc in &group_cols {
         needed[gc] = true;
     }
     if let Some(ref w) = sel.where_clause {
@@ -3324,10 +3411,11 @@ fn try_vectorized_group_by(
                     Some(i) => i,
                     None => return Ok(None),
                 };
-                if Some(ci) != group_col {
-                    return Ok(None);
-                }
-                item_plan.push(None);
+                let gpos = match group_cols.iter().position(|&g| g == ci) {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                item_plan.push(VecSelectItem::GroupCol(gpos));
             }
             Expr::Aggregate(agg) => {
                 let kind = match agg {
@@ -3423,14 +3511,14 @@ fn try_vectorized_group_by(
                 };
                 let ai = agg_kinds.len();
                 agg_kinds.push(kind);
-                item_plan.push(Some(ai));
+                item_plan.push(VecSelectItem::Agg(ai));
             }
             _ => return Ok(None),
         }
     }
 
-    // If HAVING is present, allow simple `COUNT(*) op lit` or `alias op lit` for comparison ops only
-    let having_agg_idx: Option<(usize, BinOp, Value)> = if let Some(ref h) = sel.having {
+    // If HAVING is present, allow `COUNT(*) op lit`, `agg_alias op lit`, or `group_col op lit`
+    let having_check: Option<(VecSelectItem, BinOp, Value)> = if let Some(ref h) = sel.having {
         if let Expr::Binary { left, op, right } = h {
             if !matches!(
                 op,
@@ -3443,16 +3531,12 @@ fn try_vectorized_group_by(
                     Expr::Aggregate(AggFunc::CountStar) => {
                         let ai = agg_kinds.len();
                         agg_kinds.push(VecAggKind::CountStar);
-                        Some((ai, *op, lit.clone()))
+                        Some((VecSelectItem::Agg(ai), *op, lit.clone()))
                     }
                     Expr::Column { table: None, name } => {
                         if let Some(pos) = out_cols.iter().position(|c| c.eq_ignore_ascii_case(name))
                         {
-                            if let Some(ai) = item_plan[pos] {
-                                Some((ai, *op, lit.clone()))
-                            } else {
-                                return Ok(None);
-                            }
+                            Some((item_plan[pos], *op, lit.clone()))
                         } else {
                             return Ok(None);
                         }
@@ -3469,9 +3553,37 @@ fn try_vectorized_group_by(
         None
     };
 
+    // Pre-validate ORDER BY references before scanning
+    let mut order_plan: Vec<(VecSelectItem, bool)> = Vec::with_capacity(sel.order_by.len());
+    for (oexpr, asc) in &sel.order_by {
+        match oexpr {
+            Expr::Column { table, name } => {
+                if let Some(pos) = out_cols
+                    .iter()
+                    .position(|c| table.is_none() && c.eq_ignore_ascii_case(name))
+                {
+                    order_plan.push((item_plan[pos], *asc));
+                } else if alias_matches(table, base_alias) {
+                    if let Some(ci) = base_schema.col_index(name) {
+                        if let Some(gpos) = group_cols.iter().position(|&g| g == ci) {
+                            order_plan.push((VecSelectItem::GroupCol(gpos), *asc));
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
     let (groups, m) = db.vectorized_group_by(
         &base_schema.name,
-        group_col,
+        &group_cols,
         &agg_kinds,
         vec_filter.as_ref(),
         sel.where_clause.as_ref(),
@@ -3479,9 +3591,12 @@ fn try_vectorized_group_by(
     )?;
 
     let mut out_rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(groups.len());
-    for (gkey, agg_vals) in groups {
-        if let Some((ai, op, ref lit)) = having_agg_idx {
-            let v = &agg_vals[ai];
+    for (gkeys, agg_vals) in groups {
+        if let Some((target, op, ref lit)) = having_check {
+            let v = match target {
+                VecSelectItem::GroupCol(gp) => &gkeys[gp],
+                VecSelectItem::Agg(ai) => &agg_vals[ai],
+            };
             if v.is_null() || lit.is_null() {
                 continue;
             }
@@ -3501,28 +3616,24 @@ fn try_vectorized_group_by(
         }
         let mut proj = Vec::with_capacity(item_plan.len());
         for p in &item_plan {
-            match p {
-                None => proj.push(gkey.clone().unwrap_or(Value::Null)),
-                Some(ai) => proj.push(agg_vals[*ai].clone()),
+            match *p {
+                VecSelectItem::GroupCol(gp) => proj.push(gkeys[gp].clone()),
+                VecSelectItem::Agg(ai) => proj.push(agg_vals[ai].clone()),
             }
         }
-        let mut skeys = Vec::with_capacity(sel.order_by.len());
-        for (oexpr, _) in &sel.order_by {
-            if let Expr::Column { table: None, name } = oexpr {
-                if let Some(pos) = out_cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
-                    skeys.push(proj[pos].clone());
-                    continue;
-                }
+        let mut skeys = Vec::with_capacity(order_plan.len());
+        for &(op_item, _) in &order_plan {
+            match op_item {
+                VecSelectItem::GroupCol(gp) => skeys.push(gkeys[gp].clone()),
+                VecSelectItem::Agg(ai) => skeys.push(agg_vals[ai].clone()),
             }
-            return Ok(None);
         }
         out_rows.push((proj, skeys));
     }
 
-    if !sel.order_by.is_empty() {
-        let dirs: Vec<bool> = sel.order_by.iter().map(|(_, asc)| *asc).collect();
+    if !order_plan.is_empty() {
         out_rows.sort_by(|a, b| {
-            for (i, &asc) in dirs.iter().enumerate() {
+            for (i, &(_, asc)) in order_plan.iter().enumerate() {
                 let o = a.1[i].sql_cmp(&b.1[i]);
                 if o != Ordering::Equal {
                     return if asc { o } else { o.reverse() };
@@ -3549,16 +3660,27 @@ fn try_vectorized_group_by(
     } else {
         String::new()
     };
+    let gb_note = if group_cols.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = group_cols
+            .iter()
+            .map(|&ci| base_schema.columns[ci].name.as_str())
+            .collect();
+        format!(" GROUP BY ({})", names.join(", "))
+    };
     let plan = format!(
-        "VECTORIZED COLUMNAR SCAN + STREAMING HASH AGGREGATE '{}'{} | total_pages={} | pruned: zonemap={} bloom={} | scanned={} -> {} groups",
+        "VECTORIZED COLUMNAR SCAN + STREAMING HASH AGGREGATE '{}'{}'{} | total_pages={} | pruned: zonemap={} bloom={} | scanned={} -> {} groups",
         base_schema.name,
+        gb_note,
         parallel_note,
         m.total_pages,
         m.pruned_by_zonemap,
         m.pruned_by_bloom,
         m.pages_scanned,
         final_rows.len()
-    );
+    )
+    .replace("''", "'");
     Ok(Some((out_cols, final_rows, plan)))
 }
 
@@ -3911,6 +4033,316 @@ fn eval_window_column(
     Ok(result)
 }
 
+// ============================================================================
+// Cost-Based Join Reordering (Selinger DP + Single-Table Predicate Pushdown)
+// ============================================================================
+
+fn split_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            split_and_conjuncts(left, out);
+            split_and_conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn combine_and_exprs(mut exprs: Vec<Expr>) -> Option<Expr> {
+    let mut it = exprs.drain(..);
+    let first = it.next()?;
+    Some(it.fold(first, |acc, e| Expr::Binary {
+        left: Box::new(acc),
+        op: BinOp::And,
+        right: Box::new(e),
+    }))
+}
+
+struct RelMeta {
+    alias: String,
+    col_names: Vec<String>,
+    unique_cols: HashSet<usize>,
+    base_row_count: usize,
+    physical_table: Option<String>,
+}
+
+/// Computes the bitmask of relations in `0..inner_count` referenced by `expr`.
+/// Returns `None` if `expr` references a relation outside `0..inner_count`, an ambiguous
+/// unqualified column, or an unknown column (leaving it to normal post-join evaluation).
+fn expr_inner_rel_mask(expr: &Expr, all_rels: &[RelMeta], inner_count: usize) -> Option<u64> {
+    fn walk(expr: &Expr, all_rels: &[RelMeta], inner_count: usize, mask: &mut u64) -> Option<()> {
+        match expr {
+            Expr::Literal(_) => Some(()),
+            Expr::Column { table: Some(t), name } => {
+                let ri = all_rels
+                    .iter()
+                    .position(|r| r.alias.eq_ignore_ascii_case(t))?;
+                if ri >= inner_count || ri >= 64 {
+                    return None;
+                }
+                if !all_rels[ri]
+                    .col_names
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(name))
+                {
+                    return None;
+                }
+                *mask |= 1u64 << ri;
+                Some(())
+            }
+            Expr::Column { table: None, name } => {
+                let mut found: Option<usize> = None;
+                for (ri, rel) in all_rels.iter().enumerate() {
+                    if rel.col_names.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                        if found.is_some() {
+                            return None; // Ambiguous across relations
+                        }
+                        found = Some(ri);
+                    }
+                }
+                let ri = found?;
+                if ri >= inner_count || ri >= 64 {
+                    return None;
+                }
+                *mask |= 1u64 << ri;
+                Some(())
+            }
+            Expr::UnaryNot(e) | Expr::UnaryNeg(e) | Expr::IsNull { expr: e, .. } => {
+                walk(e, all_rels, inner_count, mask)
+            }
+            Expr::Binary { left, right, .. } => {
+                walk(left, all_rels, inner_count, mask)?;
+                walk(right, all_rels, inner_count, mask)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                walk(expr, all_rels, inner_count, mask)?;
+                walk(low, all_rels, inner_count, mask)?;
+                walk(high, all_rels, inner_count, mask)
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, all_rels, inner_count, mask)?;
+                for item in list {
+                    walk(item, all_rels, inner_count, mask)?;
+                }
+                Some(())
+            }
+            Expr::Case { whens, else_expr } => {
+                for (c, v) in whens {
+                    walk(c, all_rels, inner_count, mask)?;
+                    walk(v, all_rels, inner_count, mask)?;
+                }
+                if let Some(e) = else_expr {
+                    walk(e, all_rels, inner_count, mask)?;
+                }
+                Some(())
+            }
+            Expr::InSubquery { .. } | Expr::Aggregate(_) | Expr::Window { .. } => None,
+        }
+    }
+    let mut mask = 0u64;
+    walk(expr, all_rels, inner_count, &mut mask)?;
+    Some(mask)
+}
+
+fn resolve_col_in_rels(
+    table: Option<&str>,
+    name: &str,
+    all_rels: &[RelMeta],
+    inner_count: usize,
+) -> Option<(usize, usize)> {
+    if let Some(t) = table {
+        let ri = all_rels
+            .iter()
+            .position(|r| r.alias.eq_ignore_ascii_case(t))?;
+        if ri >= inner_count {
+            return None;
+        }
+        let ci = all_rels[ri]
+            .col_names
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))?;
+        Some((ri, ci))
+    } else {
+        let mut found = None;
+        for (ri, rel) in all_rels.iter().enumerate() {
+            if let Some(ci) = rel.col_names.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((ri, ci));
+            }
+        }
+        let (ri, ci) = found?;
+        if ri < inner_count {
+            Some((ri, ci))
+        } else {
+            None
+        }
+    }
+}
+
+/// Computes the minimum-cost left-deep join order for `n` inner-joined relations using
+/// Selinger-style subset DP (`n <= 10`) or greedy minimum-cost selection (`n > 10`).
+fn plan_inner_join_order(
+    rels: &[RelMeta],
+    filtered_cards: &[usize],
+    equi_edges: &[(usize, usize, usize, usize)], // (rel_a, col_a, rel_b, col_b)
+) -> Vec<usize> {
+    let n = rels.len();
+    if n <= 1 {
+        return (0..n).collect();
+    }
+
+    let step_cost_and_out = |left_mask: u64, left_rows: f64, next: usize| -> (f64, f64) {
+        let r = filtered_cards[next] as f64;
+        let mut has_equi = false;
+        let mut hits_right_unique = false;
+        let mut hits_left_unique_rel: Option<usize> = None;
+
+        for &(ra, ca, rb, cb) in equi_edges {
+            if ra == next && ((left_mask & (1u64 << rb)) != 0) {
+                has_equi = true;
+                if rels[ra].unique_cols.contains(&ca) {
+                    hits_right_unique = true;
+                }
+                if rels[rb].unique_cols.contains(&cb) {
+                    hits_left_unique_rel = Some(rb);
+                }
+            } else if rb == next && ((left_mask & (1u64 << ra)) != 0) {
+                has_equi = true;
+                if rels[rb].unique_cols.contains(&cb) {
+                    hits_right_unique = true;
+                }
+                if rels[ra].unique_cols.contains(&ca) {
+                    hits_left_unique_rel = Some(ra);
+                }
+            }
+        }
+
+        if has_equi {
+            let join_cost = 1.5 * left_rows.min(r) + 1.0 * left_rows.max(r);
+            let mut out_rows = if left_rows == 0.0 || r == 0.0 {
+                0.0
+            } else if hits_right_unique {
+                let sel = (r / (rels[next].base_row_count.max(1) as f64)).min(1.0);
+                (left_rows * sel).max(1.0)
+            } else if let Some(lrel) = hits_left_unique_rel {
+                let sel = (left_rows / (rels[lrel].base_row_count.max(1) as f64)).min(1.0);
+                (r * sel).max(1.0)
+            } else {
+                ((left_rows * r) / left_rows.max(r).max(10.0)).max(1.0)
+            };
+            if left_rows == 0.0 || r == 0.0 {
+                out_rows = 0.0;
+            }
+            (join_cost + 0.1 * out_rows, out_rows)
+        } else {
+            // Penalize Cartesian joins heavily so connected equi-joins are always preferred.
+            let join_cost = 1e9 + left_rows * r * 50.0;
+            let out_rows = left_rows * r * 0.25;
+            (join_cost, out_rows)
+        }
+    };
+
+    if n <= 10 {
+        let total_states = 1usize << n;
+        let mut best_cost = vec![f64::INFINITY; total_states];
+        let mut best_rows = vec![0.0f64; total_states];
+        let mut prev_state = vec![0usize; total_states];
+        let mut last_rel = vec![0usize; total_states];
+
+        for i in 0..n {
+            let m = 1usize << i;
+            best_cost[m] = filtered_cards[i] as f64;
+            best_rows[m] = filtered_cards[i] as f64;
+            last_rel[m] = i;
+        }
+
+        for mask in 1..total_states {
+            if !best_cost[mask].is_finite() {
+                continue;
+            }
+            let l_cost = best_cost[mask];
+            let l_rows = best_rows[mask];
+            for next in 0..n {
+                if (mask & (1usize << next)) != 0 {
+                    continue;
+                }
+                let next_mask = mask | (1usize << next);
+                let (sc, out_r) = step_cost_and_out(mask as u64, l_rows, next);
+                let cand = l_cost + sc;
+                if cand < best_cost[next_mask] {
+                    best_cost[next_mask] = cand;
+                    best_rows[next_mask] = out_r;
+                    prev_state[next_mask] = mask;
+                    last_rel[next_mask] = next;
+                }
+            }
+        }
+
+        let mut order = Vec::with_capacity(n);
+        let mut cur = total_states - 1;
+        while cur != 0 {
+            order.push(last_rel[cur]);
+            cur = prev_state[cur];
+        }
+        order.reverse();
+        order
+    } else {
+        // Greedy fallback for > 10 joined tables
+        let mut remaining: Vec<usize> = (0..n).collect();
+        let first_pos = remaining
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &ri)| filtered_cards[ri])
+            .map(|(p, _)| p)
+            .unwrap_or(0);
+        let first = remaining.remove(first_pos);
+        let mut order = vec![first];
+        let mut mask = 1u64 << first;
+        let mut cur_rows = filtered_cards[first] as f64;
+
+        while !remaining.is_empty() {
+            let mut best_pos = 0usize;
+            let mut best_c = f64::INFINITY;
+            let mut best_out = cur_rows;
+            for (pos, &cand) in remaining.iter().enumerate() {
+                let (c, out_r) = step_cost_and_out(mask, cur_rows, cand);
+                if c < best_c {
+                    best_c = c;
+                    best_out = out_r;
+                    best_pos = pos;
+                }
+            }
+            let chosen = remaining.remove(best_pos);
+            order.push(chosen);
+            if chosen < 64 {
+                mask |= 1u64 << chosen;
+            }
+            cur_rows = best_out;
+        }
+        order
+    }
+}
+
+fn hash_row_keys(vals: &[Value], idxs: &[usize]) -> Option<u64> {
+    if idxs.len() == 1 {
+        return hash_value(&vals[idxs[0]]);
+    }
+    let mut acc = 0x517c_c1b7_2722_0a95u64;
+    for &i in idxs {
+        let h = hash_value(&vals[i])?;
+        acc = acc.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ h;
+        acc ^= acc >> 30;
+    }
+    Some(acc)
+}
+
 fn execute_select(
     db: &mut Database,
     sel: &SelectStmt,
@@ -4111,9 +4543,434 @@ fn execute_select_with_ctes(
         }
     }
 
-    // 3. Load base table / CTE / FROM-subquery
-    let (mut eval_schema, mut rows): (EvalSchema, Vec<(Option<i64>, Vec<Value>)>) =
-        match &sel_eff.from.factor {
+    // 3. Load base table / CTE / FROM-subquery and execute JOINs.
+    //    When leading INNER JOINs are present, use cost-based join reordering (Selinger DP +
+    //    single-table predicate pushdown + smaller-side multi-column hash build).
+    let inner_prefix_len = sel_eff
+        .joins
+        .iter()
+        .take_while(|j| j.kind == JoinKind::Inner)
+        .count();
+
+    let mut remaining_where_override: Option<Option<Expr>> = None;
+    let mut syntactic_alias_order: Vec<String> = Vec::new();
+    let (mut eval_schema, mut rows): (EvalSchema, Vec<(Option<i64>, Vec<Value>)>);
+
+    if inner_prefix_len >= 1 {
+        // Gather metadata for all relations (leading INNER JOIN block + trailing joins) so
+        // unqualified column ambiguity checks match full query scope.
+        let inner_count = 1 + inner_prefix_len;
+        let mut all_refs: Vec<&TableRef> = Vec::with_capacity(1 + sel_eff.joins.len());
+        all_refs.push(&sel_eff.from);
+        for j in &sel_eff.joins {
+            all_refs.push(&j.table);
+        }
+
+        let mut all_metas: Vec<RelMeta> = Vec::with_capacity(all_refs.len());
+        let mut cached_virtual: Vec<Option<Vec<Vec<Value>>>> = vec![None; all_refs.len()];
+        let mut seen_aliases: HashSet<String> = HashSet::new();
+
+        for (ri, tref) in all_refs.iter().enumerate() {
+            let (meta, vrows) = match &tref.factor {
+                TableFactor::Subquery(sub) => {
+                    let (scols, srows, _) = execute_select_with_ctes(db, sub, &ctes)?;
+                    let alias = tref.alias.clone().unwrap_or_else(|| "_sub".into());
+                    let m = RelMeta {
+                        alias,
+                        col_names: scols,
+                        unique_cols: HashSet::new(),
+                        base_row_count: srows.len(),
+                        physical_table: None,
+                    };
+                    (m, Some(srows))
+                }
+                TableFactor::Table(tname) => {
+                    let lower = tname.to_ascii_lowercase();
+                    if let Some((ccols, crows)) = ctes.get(&lower) {
+                        let alias = tref.alias.clone().unwrap_or_else(|| tname.clone());
+                        let m = RelMeta {
+                            alias,
+                            col_names: ccols.clone(),
+                            unique_cols: HashSet::new(),
+                            base_row_count: crows.len(),
+                            physical_table: None,
+                        };
+                        (m, Some(crows.clone()))
+                    } else {
+                        let rs = db
+                            .table_schema(tname)
+                            .ok_or_else(|| Error::Schema(format!("No such table: '{}'", tname)))?
+                            .clone();
+                        let alias = tref.alias.clone().unwrap_or_else(|| rs.name.clone());
+                        let unique_cols: HashSet<usize> = rs
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.primary_key || c.unique)
+                            .map(|(i, _)| i)
+                            .collect();
+                        let base_row_count = db.count_rows(&rs.name)? as usize;
+                        let m = RelMeta {
+                            alias,
+                            col_names: rs.columns.iter().map(|c| c.name.clone()).collect(),
+                            unique_cols,
+                            base_row_count,
+                            physical_table: Some(rs.name.clone()),
+                        };
+                        (m, None)
+                    }
+                }
+            };
+            let alias_l = meta.alias.to_ascii_lowercase();
+            if !seen_aliases.insert(alias_l) {
+                return Err(Error::Sql(format!(
+                    "Duplicate table alias '{}' in FROM/JOIN clause",
+                    meta.alias
+                )));
+            }
+            syntactic_alias_order.push(meta.alias.clone());
+            all_metas.push(meta);
+            cached_virtual[ri] = vrows;
+        }
+
+        // Partition ON clauses of the leading INNER JOIN block + top-level WHERE conjuncts into:
+        //   - single_filters[i]: pushed directly into relation i's scan (indexes/Bloom/zonemaps!)
+        //   - join_conjuncts: multi-table inner predicates evaluated as soon as their tables join
+        //   - post_where: predicates referencing trailing LEFT JOIN tables or unresolved columns
+        let mut single_filters: Vec<Vec<Expr>> = vec![Vec::new(); inner_count];
+        let mut join_conjuncts: Vec<(u64, Expr)> = Vec::new();
+        let mut post_where: Vec<Expr> = Vec::new();
+
+        for j in &sel_eff.joins[..inner_prefix_len] {
+            let mut parts = Vec::new();
+            split_and_conjuncts(&j.on, &mut parts);
+            for p in parts {
+                match expr_inner_rel_mask(p, &all_metas, inner_count) {
+                    Some(mask) if mask.count_ones() == 1 => {
+                        let ri = mask.trailing_zeros() as usize;
+                        single_filters[ri].push(p.clone());
+                    }
+                    Some(mask) if mask != 0 => {
+                        join_conjuncts.push((mask, p.clone()));
+                    }
+                    _ => post_where.push(p.clone()),
+                }
+            }
+        }
+        if let Some(ref w) = sel_eff.where_clause {
+            let mut parts = Vec::new();
+            split_and_conjuncts(w, &mut parts);
+            for p in parts {
+                match expr_inner_rel_mask(p, &all_metas, inner_count) {
+                    Some(mask) if mask.count_ones() == 1 => {
+                        let ri = mask.trailing_zeros() as usize;
+                        single_filters[ri].push(p.clone());
+                    }
+                    Some(mask) if mask != 0 => {
+                        join_conjuncts.push((mask, p.clone()));
+                    }
+                    _ => post_where.push(p.clone()),
+                }
+            }
+        }
+        remaining_where_override = Some(combine_and_exprs(post_where));
+
+        // Load each relation in 0..inner_count with its pushed single-table filters!
+        let mut rel_rows: Vec<Vec<Vec<Value>>> = Vec::with_capacity(inner_count);
+        for ri in 0..inner_count {
+            let pushed = combine_and_exprs(std::mem::take(&mut single_filters[ri]));
+            let loaded: Vec<Vec<Value>> = if let Some(ref tbl_name) = all_metas[ri].physical_table {
+                let (sc, m) = db.scan_filtered_with_alias(
+                    tbl_name,
+                    Some(&all_metas[ri].alias),
+                    pushed.as_ref(),
+                    None,
+                )?;
+                plan_notes.push(format!(
+                    "SCAN '{}' (as '{}') | total_pages={} | pruned: index={} zonemap={} bloom={} | scanned={} -> {} rows",
+                    tbl_name,
+                    all_metas[ri].alias,
+                    m.total_pages,
+                    m.pruned_by_index,
+                    m.pruned_by_zonemap,
+                    m.pruned_by_bloom,
+                    m.pages_scanned,
+                    sc.len()
+                ));
+                sc.into_iter().map(|r| r.values).collect()
+            } else {
+                let mut vrows = cached_virtual[ri].take().unwrap_or_default();
+                if let Some(ref pf) = pushed {
+                    let es = EvalSchema::from_names(&all_metas[ri].alias, &all_metas[ri].col_names);
+                    let mut filt = Vec::with_capacity(vrows.len());
+                    for r in vrows {
+                        if value_to_bool(eval_expr_ctx(pf, &es, Some(&r), None, None)?)?
+                            == Some(true)
+                        {
+                            filt.push(r);
+                        }
+                    }
+                    vrows = filt;
+                }
+                plan_notes.push(format!(
+                    "SCAN VIRTUAL '{}' -> {} rows",
+                    all_metas[ri].alias,
+                    vrows.len()
+                ));
+                vrows
+            };
+            rel_rows.push(loaded);
+        }
+
+        let filtered_cards: Vec<usize> = rel_rows.iter().map(|r| r.len()).collect();
+
+        // Extract equi-join edges for Selinger DP cost estimation
+        let mut equi_edges: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (_, expr) in &join_conjuncts {
+            if let Expr::Binary {
+                left,
+                op: BinOp::Eq,
+                right,
+            } = expr
+            {
+                if let (
+                    Expr::Column {
+                        table: lt,
+                        name: ln,
+                    },
+                    Expr::Column {
+                        table: rt,
+                        name: rn,
+                    },
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if let (Some((ra, ca)), Some((rb, cb))) = (
+                        resolve_col_in_rels(lt.as_deref(), ln, &all_metas, inner_count),
+                        resolve_col_in_rels(rt.as_deref(), rn, &all_metas, inner_count),
+                    ) {
+                        if ra != rb {
+                            equi_edges.push((ra, ca, rb, cb));
+                        }
+                    }
+                }
+            }
+        }
+
+        let join_order =
+            plan_inner_join_order(&all_metas[..inner_count], &filtered_cards, &equi_edges);
+        let order_desc: Vec<String> = join_order
+            .iter()
+            .map(|&ri| format!("{}({})", all_metas[ri].alias, filtered_cards[ri]))
+            .collect();
+        plan_notes.push(format!(
+            "COST-BASED JOIN ORDER [{}]",
+            order_desc.join(" -> ")
+        ));
+
+        // Execute left-deep joins in optimal cost order with multi-column smaller-side hash joins
+        let first_ri = join_order[0];
+        eval_schema =
+            EvalSchema::from_names(&all_metas[first_ri].alias, &all_metas[first_ri].col_names);
+        rows = std::mem::take(&mut rel_rows[first_ri])
+            .into_iter()
+            .map(|v| (None, v))
+            .collect();
+        let mut active_mask: u64 = if first_ri < 64 { 1u64 << first_ri } else { 0 };
+        let mut used_conjunct = vec![false; join_conjuncts.len()];
+
+        for &next_ri in &join_order[1..] {
+            let right_alias = all_metas[next_ri].alias.clone();
+            let right_col_names = all_metas[next_ri].col_names.clone();
+            let right_rows = std::mem::take(&mut rel_rows[next_ri]);
+            let left_width = eval_schema.cols.len();
+            let right_width = right_col_names.len();
+            eval_schema.extend(&right_alias, &right_col_names);
+
+            if next_ri < 64 {
+                active_mask |= 1u64 << next_ri;
+            }
+
+            // Pull all join conjuncts now completely covered by `active_mask`
+            let mut equi_pairs: Vec<(usize, usize)> = Vec::new();
+            let mut residuals: Vec<Expr> = Vec::new();
+            for (ci, (cmask, cexpr)) in join_conjuncts.iter().enumerate() {
+                if used_conjunct[ci] || (*cmask & !active_mask) != 0 {
+                    continue;
+                }
+                used_conjunct[ci] = true;
+                let mut extracted = false;
+                if let Expr::Binary {
+                    left,
+                    op: BinOp::Eq,
+                    right,
+                } = cexpr
+                {
+                    if let (
+                        Expr::Column {
+                            table: lt,
+                            name: ln,
+                        },
+                        Expr::Column {
+                            table: rt,
+                            name: rn,
+                        },
+                    ) = (left.as_ref(), right.as_ref())
+                    {
+                        let li = eval_schema.resolve(lt.as_deref(), ln).ok();
+                        let ri = eval_schema.resolve(rt.as_deref(), rn).ok();
+                        match (li, ri) {
+                            (Some(a), Some(b)) if a < left_width && b >= left_width => {
+                                equi_pairs.push((a, b - left_width));
+                                extracted = true;
+                            }
+                            (Some(a), Some(b)) if b < left_width && a >= left_width => {
+                                equi_pairs.push((b, a - left_width));
+                                extracted = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !extracted {
+                    residuals.push(cexpr.clone());
+                }
+            }
+
+            let mut joined: Vec<(Option<i64>, Vec<Value>)> = Vec::new();
+            if !equi_pairs.is_empty() {
+                let l_idxs: Vec<usize> = equi_pairs.iter().map(|&(l, _)| l).collect();
+                let r_idxs: Vec<usize> = equi_pairs.iter().map(|&(_, r)| r).collect();
+                let build_right = right_rows.len() <= rows.len();
+                plan_notes.push(format!(
+                    "HASH Inner JOIN '{}' (build={}, left={}, right={})",
+                    right_alias,
+                    if build_right { "right" } else { "left" },
+                    rows.len(),
+                    right_rows.len()
+                ));
+
+                if build_right {
+                    let mut ht: HashMap<u64, Vec<usize>> = HashMap::with_capacity(right_rows.len());
+                    for (ri, rrow) in right_rows.iter().enumerate() {
+                        if let Some(h) = hash_row_keys(rrow, &r_idxs) {
+                            ht.entry(h).or_default().push(ri);
+                        }
+                    }
+                    for (_, lvals) in rows {
+                        if let Some(h) = hash_row_keys(&lvals, &l_idxs) {
+                            if let Some(bucket) = ht.get(&h) {
+                                for &ri in bucket {
+                                    let rrow = &right_rows[ri];
+                                    if equi_pairs
+                                        .iter()
+                                        .all(|&(li, ri_col)| lvals[li].sql_cmp(&rrow[ri_col]).is_eq())
+                                    {
+                                        let mut combined =
+                                            Vec::with_capacity(left_width + right_width);
+                                        combined.extend_from_slice(&lvals);
+                                        combined.extend_from_slice(rrow);
+                                        let mut ok = true;
+                                        for res in &residuals {
+                                            if value_to_bool(eval_expr_ctx(
+                                                res,
+                                                &eval_schema,
+                                                Some(&combined),
+                                                None,
+                                                None,
+                                            )?)? != Some(true)
+                                            {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if ok {
+                                            joined.push((None, combined));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let mut ht: HashMap<u64, Vec<usize>> = HashMap::with_capacity(rows.len());
+                    for (li_pos, (_, lvals)) in rows.iter().enumerate() {
+                        if let Some(h) = hash_row_keys(lvals, &l_idxs) {
+                            ht.entry(h).or_default().push(li_pos);
+                        }
+                    }
+                    for rrow in &right_rows {
+                        if let Some(h) = hash_row_keys(rrow, &r_idxs) {
+                            if let Some(bucket) = ht.get(&h) {
+                                for &li_pos in bucket {
+                                    let lvals = &rows[li_pos].1;
+                                    if equi_pairs
+                                        .iter()
+                                        .all(|&(li, ri_col)| lvals[li].sql_cmp(&rrow[ri_col]).is_eq())
+                                    {
+                                        let mut combined =
+                                            Vec::with_capacity(left_width + right_width);
+                                        combined.extend_from_slice(lvals);
+                                        combined.extend_from_slice(rrow);
+                                        let mut ok = true;
+                                        for res in &residuals {
+                                            if value_to_bool(eval_expr_ctx(
+                                                res,
+                                                &eval_schema,
+                                                Some(&combined),
+                                                None,
+                                                None,
+                                            )?)? != Some(true)
+                                            {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if ok {
+                                            joined.push((None, combined));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                plan_notes.push(format!(
+                    "NESTED-LOOP Inner JOIN '{}' (left={}, right={})",
+                    right_alias,
+                    rows.len(),
+                    right_rows.len()
+                ));
+                for (_, lvals) in rows {
+                    for rrow in &right_rows {
+                        let mut combined = Vec::with_capacity(left_width + right_width);
+                        combined.extend_from_slice(&lvals);
+                        combined.extend_from_slice(rrow);
+                        let mut ok = true;
+                        for res in &residuals {
+                            if value_to_bool(eval_expr_ctx(
+                                res,
+                                &eval_schema,
+                                Some(&combined),
+                                None,
+                                None,
+                            )?)? != Some(true)
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            joined.push((None, combined));
+                        }
+                    }
+                }
+            }
+            rows = joined;
+        }
+    } else {
+        // Single-table query or starts immediately with LEFT JOIN
+        let (es, base_rows) = match &sel_eff.from.factor {
             TableFactor::Subquery(sub) => {
                 let (scols, srows, _) = execute_select_with_ctes(db, sub, &ctes)?;
                 let alias = sel_eff.from.alias.as_deref().unwrap_or("_sub");
@@ -4214,9 +5071,12 @@ fn execute_select_with_ctes(
                 }
             }
         };
+        eval_schema = es;
+        rows = base_rows;
+    }
 
-    // 4. Execute JOINs (Hash Join for equi-joins, nested-loop fallback)
-    for join in &sel_eff.joins {
+    // 4. Execute any remaining JOINs starting at the first LEFT JOIN (preserves LEFT JOIN semantics)
+    for join in &sel_eff.joins[inner_prefix_len..] {
         let (right_alias, right_col_names, right_rows): (String, Vec<String>, Vec<Vec<Value>>) =
             match &join.table.factor {
                 TableFactor::Subquery(sub) => {
@@ -4363,20 +5223,50 @@ fn execute_select_with_ctes(
         rows = joined;
     }
 
-    // 5. Apply WHERE if not already applied during physical single-table scan
-    if !sel_eff.joins.is_empty() || physical_base.is_none() {
-        if let Some(ref w) = sel_eff.where_clause {
-            let mut filtered = Vec::with_capacity(rows.len());
-            for (rid, vals) in rows {
-                if value_to_bool(eval_expr_ctx(w, &eval_schema, Some(&vals), rid, None)?)?
-                    == Some(true)
-                {
-                    filtered.push((rid, vals));
+    // 5. Apply any remaining WHERE conjuncts not already pushed into single-table/join scans
+    let effective_post_where = match remaining_where_override {
+        Some(opt) => opt,
+        None => {
+            if !sel_eff.joins.is_empty() || physical_base.is_none() {
+                sel_eff.where_clause.clone()
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(ref w) = effective_post_where {
+        let mut filtered = Vec::with_capacity(rows.len());
+        for (rid, vals) in rows {
+            if value_to_bool(eval_expr_ctx(w, &eval_schema, Some(&vals), rid, None)?)?
+                == Some(true)
+            {
+                filtered.push((rid, vals));
+            }
+        }
+        rows = filtered;
+    }
+
+    // Preserve syntactic FROM/JOIN column order for `SELECT *` even when joins were reordered.
+    let wildcard_indices: Vec<usize> = if syntactic_alias_order.is_empty() {
+        (0..eval_schema.cols.len()).collect()
+    } else {
+        let mut order = Vec::with_capacity(eval_schema.cols.len());
+        let mut included = vec![false; eval_schema.cols.len()];
+        for alias in &syntactic_alias_order {
+            for (i, (ta, _)) in eval_schema.cols.iter().enumerate() {
+                if !included[i] && ta.eq_ignore_ascii_case(alias) {
+                    order.push(i);
+                    included[i] = true;
                 }
             }
-            rows = filtered;
         }
-    }
+        for (i, &inc) in included.iter().enumerate() {
+            if !inc {
+                order.push(i);
+            }
+        }
+        order
+    };
 
     let has_agg = !sel_eff.group_by.is_empty()
         || sel_eff.having.is_some()
@@ -4389,8 +5279,8 @@ fn execute_select_with_ctes(
     for item in &sel_eff.items {
         match item {
             SelectItem::Wildcard(None) => {
-                for (_, cn) in &eval_schema.cols {
-                    out_cols.push(cn.clone());
+                for &wi in &wildcard_indices {
+                    out_cols.push(eval_schema.cols[wi].1.clone());
                 }
             }
             SelectItem::Wildcard(Some(tbl)) => {
@@ -4459,9 +5349,11 @@ fn execute_select_with_ctes(
                 match item {
                     SelectItem::Wildcard(None) => {
                         if let Some(r) = rep_row {
-                            proj.extend_from_slice(r);
+                            for &wi in &wildcard_indices {
+                                proj.push(r[wi].clone());
+                            }
                         } else {
-                            proj.resize(proj.len() + eval_schema.cols.len(), Value::Null);
+                            proj.resize(proj.len() + wildcard_indices.len(), Value::Null);
                         }
                     }
                     SelectItem::Wildcard(Some(tbl)) => {
@@ -4529,7 +5421,11 @@ fn execute_select_with_ctes(
             let mut proj = Vec::with_capacity(out_cols.len());
             for (item_idx, item) in sel_eff.items.iter().enumerate() {
                 match item {
-                    SelectItem::Wildcard(None) => proj.extend_from_slice(vals),
+                    SelectItem::Wildcard(None) => {
+                        for &wi in &wildcard_indices {
+                            proj.push(vals[wi].clone());
+                        }
+                    }
                     SelectItem::Wildcard(Some(tbl)) => {
                         for (i, (ta, _)) in eval_schema.cols.iter().enumerate() {
                             if ta.eq_ignore_ascii_case(tbl) {
@@ -4632,6 +5528,35 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
             Ok(QueryResult::Message(format!(
                 "Added column '{}' to '{}'.",
                 cname, table
+            )))
+        }
+        Statement::AlterDropColumn {
+            table,
+            column,
+            if_exists,
+        } => {
+            let dropped = db.drop_column(&table, &column, if_exists)?;
+            if dropped {
+                Ok(QueryResult::Message(format!(
+                    "Dropped column '{}' from '{}'.",
+                    column, table
+                )))
+            } else {
+                Ok(QueryResult::Message(format!(
+                    "Column '{}' does not exist on '{}'.",
+                    column, table
+                )))
+            }
+        }
+        Statement::AlterRenameColumn {
+            table,
+            old_name,
+            new_name,
+        } => {
+            db.rename_column(&table, &old_name, &new_name)?;
+            Ok(QueryResult::Message(format!(
+                "Renamed column '{}' to '{}' on '{}'.",
+                old_name, new_name, table
             )))
         }
         Statement::DropTable { if_exists, name } => {

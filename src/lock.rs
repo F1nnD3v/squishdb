@@ -78,6 +78,27 @@ mod sys {
         }
     }
 
+    pub fn lock_blocking(file: &File, exclusive: bool) -> std::io::Result<()> {
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: core::ptr::null_mut(),
+        };
+        let flags = if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK
+        } else {
+            0
+        };
+        let ok = unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut ov) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     pub fn unlock(file: &File) {
         let mut ov = Overlapped {
             internal: 0,
@@ -125,6 +146,21 @@ mod sys {
         }
     }
 
+    pub fn lock_blocking(file: &File, exclusive: bool) -> std::io::Result<()> {
+        let op = if exclusive { LOCK_EX } else { LOCK_SH };
+        loop {
+            let rc = unsafe { flock(file.as_raw_fd(), op) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
     pub fn unlock(file: &File) {
         unsafe {
             let _ = flock(file.as_raw_fd(), LOCK_UN);
@@ -142,7 +178,15 @@ impl OsFileLock {
     /// Acquires a non-blocking OS-level lock (exclusive for read-write, shared for read-only).
     /// Returns `Error::Busy` immediately if another handle/process holds a conflicting lock.
     pub fn try_acquire(db_path: &Path, exclusive: bool) -> Result<Self> {
-        let lock_path = Self::lock_path_for(db_path);
+        Self::try_acquire_path(Self::lock_path_for(db_path), db_path, exclusive)
+    }
+
+    /// Acquires a non-blocking OS-level lock on an explicit lock file path.
+    pub fn try_acquire_path(
+        lock_path: PathBuf,
+        display_path: &Path,
+        exclusive: bool,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -154,10 +198,26 @@ impl OsFileLock {
         if !acquired {
             return Err(Error::Busy(format!(
                 "Database '{}' is locked by another {} connection",
-                db_path.display(),
+                display_path.display(),
                 if exclusive { "reader/writer" } else { "writer" }
             )));
         }
+        Ok(OsFileLock {
+            _file: file,
+            _path: lock_path,
+            exclusive,
+        })
+    }
+
+    /// Acquires a blocking OS-level lock on an explicit lock file path (waits until available).
+    pub fn acquire_blocking_path(lock_path: PathBuf, exclusive: bool) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        sys::lock_blocking(&file, exclusive)?;
         Ok(OsFileLock {
             _file: file,
             _path: lock_path,

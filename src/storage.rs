@@ -805,6 +805,33 @@ impl StorageFile {
         Self::open_mode(path, true)
     }
 
+    /// Reads only the two 512-byte A/B superblocks to check the latest committed generation on disk.
+    pub fn read_latest_generation(path: &Path) -> Result<u64> {
+        let mut f = OpenOptions::new().read(true).open(path)?;
+        let len = f.metadata()?.len();
+        if len < DATA_START_OFFSET {
+            return Ok(0);
+        }
+        let mut buf_a = [0u8; SUPERBLOCK_SIZE as usize];
+        let mut buf_b = [0u8; SUPERBLOCK_SIZE as usize];
+        f.read_exact(&mut buf_a)?;
+        f.read_exact(&mut buf_b)?;
+        let slot_a = Superblock::inspect_slot(&buf_a);
+        let slot_b = Superblock::inspect_slot(&buf_b);
+        match (slot_a, slot_b) {
+            (SuperblockSlot::Valid(a), SuperblockSlot::Valid(b)) => {
+                Ok(a.generation.max(b.generation))
+            }
+            (SuperblockSlot::Valid(a), _) => Ok(a.generation),
+            (_, SuperblockSlot::Valid(b)) => Ok(b.generation),
+            (SuperblockSlot::Unsupported { err, .. }, _)
+            | (_, SuperblockSlot::Unsupported { err, .. }) => Err(err),
+            (SuperblockSlot::Invalid, SuperblockSlot::Invalid) => Err(Error::Corruption(
+                "Both A/B superblocks are missing or corrupted".into(),
+            )),
+        }
+    }
+
     fn open_mode(path: &Path, read_only: bool) -> Result<(Self, Catalog)> {
         let file = if read_only {
             OpenOptions::new().read(true).open(path)?

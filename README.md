@@ -141,15 +141,15 @@ A database lives in one `.sqdb` file with double-buffered A/B CRC32 superblocks,
 
 **Per-column lossless codecs.** The encoder in [src/encoding.rs](src/encoding.rs) tries codecs per column and keeps the smallest output. Integers use Constant, FOR + Bitpack, Delta + ZigZag + Bitpack, Delta + Varint, RLE, Dictionary + Bitpack, or Raw, and `INTEGER PRIMARY KEY` aliases `rowid` for zero duplicate bytes. Floats use Constant, ScaledDecimal verified bit-for-bit via `.to_bits()`, 8-lane ByteShuffle, or Raw. Text and blobs use Constant, lexicographically sorted front-coded dictionaries, or split-length Raw.
 
-**Parallel query execution and compression.** [src/parallel.rs](src/parallel.rs) runs a reusable worker pool for multi-page `GROUP BY` partial hash aggregation, parallel sequential scans, parallel PAX page compression during `bulk_insert`, `checkpoint`, and `VACUUM`, and parallel index builds. Configure worker count with `DbOptions.parallel_workers` or `SET max_parallel_workers = N;`.
+**Parallel query execution and compression.** [src/parallel.rs](src/parallel.rs) runs a reusable worker pool for single-column and multi-column vectorized `GROUP BY` partial hash aggregation, parallel sequential scans, parallel PAX page compression during `bulk_insert`, `checkpoint`, and `VACUUM`, and parallel index builds. Configure worker count with `DbOptions.parallel_workers` or `SET max_parallel_workers = N;`.
 
-**Multi-writer MVCC and nested savepoints.** [src/mvcc.rs](src/mvcc.rs) provides `SharedDatabase` and `MvccConnection` with Snapshot Isolation. Readers never block writers and writers never block readers. Disjoint row or table writes commit concurrently, while overlapping writes enforce First-Committer-Wins conflict detection. Both `Database` and `MvccConnection` support nested `SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO SAVEPOINT`.
+**Cross-process multi-writer MVCC and nested savepoints.** [src/mvcc.rs](src/mvcc.rs) provides `SharedDatabase` and `MvccConnection` with Snapshot Isolation across threads and across separate OS processes. Readers never block writers and writers never block readers. Disjoint row or table writes commit concurrently using incremental WAL sync and a CRC32-framed MVCC commit log, while overlapping writes enforce First-Committer-Wins conflict detection. Both `Database` and `MvccConnection` support nested `SAVEPOINT`, `RELEASE SAVEPOINT`, and `ROLLBACK TO SAVEPOINT`.
 
 **Composite and range B-tree secondary indexes.** [src/index.rs](src/index.rs) writes 4,096-entry front-coded compressed B-tree leaf blocks (and optional `USING HASH` blocks) with a sparse directory in the catalog, an LRU block cache in [src/cache.rs](src/cache.rs), and automatic 6-bit-per-key per-page Bloom filters. B-tree indexes handle equality, `<`, `<=`, `>`, `>=`, `BETWEEN`, `UNIQUE`, `ASC`/`DESC`, and leftmost composite prefixes.
 
-**Direct SQLite 3 migration.** [src/sqlite_import.rs](src/sqlite_import.rs) parses SQLite 3 B-tree pages, overflow chains, record serial types, and `-wal` files in pure Rust without linking `libsqlite3`, copying tables, constraints, and indexes straight into compressed PAX pages.
+**Direct SQLite 3 migration.** [src/sqlite_import.rs](src/sqlite_import.rs) parses SQLite 3 table and `WITHOUT ROWID` index B-tree pages, overflow chains, record serial types, and `-wal` files in pure Rust without linking `libsqlite3`, copying tables, constraints, and indexes straight into compressed PAX pages.
 
-**SQL engine.** [src/sql.rs](src/sql.rs) implements `WITH` CTEs, `FROM` and `IN` subqueries, window functions (`ROW_NUMBER()`, `RANK()`, `SUM`/`AVG`/`COUNT` `OVER`), hash `INNER` and `LEFT JOIN`, `GROUP BY`/`HAVING`, `FOREIGN KEY` (`RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`), `CHECK`, `UNIQUE`, `DEFAULT`, nested `SAVEPOINT`s, O(1) `ALTER TABLE ADD COLUMN`, `CLUSTER BY`, `VACUUM [SORT BY ...]`, `BACKUP TO`, and `EXPLAIN`.
+**SQL engine.** [src/sql.rs](src/sql.rs) implements `WITH` CTEs, `FROM` and `IN` subqueries, window functions (`ROW_NUMBER()`, `RANK()`, `SUM`/`AVG`/`COUNT` `OVER`), cost-based join reordering with predicate pushdown and multi-column hash `INNER` and `LEFT JOIN`, single-column and multi-column vectorized `GROUP BY`/`HAVING`, `FOREIGN KEY` (`RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`), `CHECK`, `UNIQUE`, `DEFAULT`, nested `SAVEPOINT`s, `ALTER TABLE ADD COLUMN`, `DROP COLUMN`, and `RENAME COLUMN`, `CLUSTER BY`, `VACUUM [SORT BY ...]`, `BACKUP TO`, and `EXPLAIN`.
 
 ## Benchmarks
 
@@ -161,8 +161,8 @@ Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the s
 
 | Benchmark | SQLite C | Parquet (Zstd L9) | SquishDB v0.5 | Comparison |
 |---|---:|---:|---:|---:|
-| GROUP BY + SUM/AVG/COUNT (100k rows) | 20.46 ms, 9.21 MB | n/a | 1.77 ms, 1.29 MB | 11.56x faster, 7.14x smaller |
-| 200 random UUID lookups (40k rows, B-tree) | 14.80 ms, 4.64 MB | n/a | 14.55 ms, 2.39 MB | 1.02x faster, 1.94x smaller |
+| GROUP BY + SUM/AVG/COUNT (100k rows) | 16.76 ms, 9.21 MB | n/a | 1.68 ms, 1.29 MB | 9.99x faster, 7.14x smaller |
+| 200 random UUID lookups (40k rows, B-tree) | 8.67 ms, 4.64 MB | n/a | 13.26 ms, 2.39 MB | 1.53x slower, 1.94x smaller |
 | UUID B-tree index disk overhead (40k rows) | +1,752 KB | n/a | +888 KB | 1.97x smaller B-tree index |
 | Multi-device IoT clustered (150k rows) | 7.82 MB | 1.50 MB | 0.40 MB | 19.45x smaller than SQLite, 3.75x smaller than Parquet |
 | JSON telemetry logs (80k rows) | 14.81 MB | 1.47 MB | 1.05 MB | 14.10x smaller than SQLite |
@@ -172,10 +172,10 @@ Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the s
 
 Measured in release mode:
 
-- Single-row auto-commit with `sync_wal = true` (fsync per row): 1,241 rows/sec.
-- Single-row auto-commit with `sync_wal = false` (buffered WAL): 158,626 rows/sec.
-- Batched WAL transaction at 1,000 rows per `COMMIT` with `sync_wal = true`: 445,323 rows/sec.
-- Direct bulk PAX-v4 load plus parallel Brotli checkpoint over 50,000 rows: 2,237,717 rows/sec.
+- Single-row auto-commit with `sync_wal = true` (fsync per row): 1,171 rows/sec.
+- Single-row auto-commit with `sync_wal = false` (buffered WAL): 158,645 rows/sec.
+- Batched WAL transaction at 1,000 rows per `COMMIT` with `sync_wal = true`: 412,047 rows/sec.
+- Direct bulk PAX-v4 load plus parallel Brotli checkpoint over 50,000 rows: 2,178,991 rows/sec.
 
 Single-row fsynced writes are bound by disk fsync latency, so wrap bulk writes in `BEGIN` / `COMMIT` or call `insert_batch` or `bulk_insert`.
 
@@ -188,13 +188,6 @@ BACKUP TO 'backup.sqdb';
 ```
 
 This checkpoints the WAL, writes a temporary copy, calls `sync_all`, and atomically replaces the target file. You can also run `CHECKPOINT;`, close the writer, and copy the `.sqdb` file directly.
-
-## Remaining work before 1.0
-
-- Cost-based join reordering and multi-column `GROUP BY` vectorization.
-- `ALTER TABLE DROP COLUMN` and `RENAME COLUMN`.
-- `WITHOUT ROWID` table support in `squishdb migrate`.
-- Cross-process multi-writer MVCC (today multi-writer MVCC operates across threads in one process via `SharedDatabase`, while cross-process locks use shared readers or one exclusive writer).
 
 ## Running tests and benchmarks
 

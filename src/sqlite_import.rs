@@ -183,11 +183,178 @@ impl SqliteReader {
         Ok(buf)
     }
 
+    fn read_cell_payload(
+        &mut self,
+        page: &[u8],
+        pos: usize,
+        payload_len: usize,
+        max_local: usize,
+        min_local: usize,
+    ) -> Result<Vec<u8>> {
+        let u = self.usable_size;
+        if pos > page.len() {
+            return Err(Error::Corruption("SQLite cell offset exceeds page".into()));
+        }
+        if payload_len <= max_local {
+            let end = pos
+                .checked_add(payload_len)
+                .ok_or_else(|| Error::Corruption("SQLite cell length overflow".into()))?;
+            if end > page.len() {
+                return Err(Error::Corruption("SQLite cell exceeds page".into()));
+            }
+            Ok(page[pos..end].to_vec())
+        } else {
+            let k = min_local + ((payload_len.saturating_sub(min_local)) % (u - 4));
+            let local_len = if k <= max_local { k } else { min_local };
+            let ptr_end = pos
+                .checked_add(local_len)
+                .and_then(|x| x.checked_add(4))
+                .ok_or_else(|| Error::Corruption("SQLite overflow cell offset overflow".into()))?;
+            if ptr_end > page.len() {
+                return Err(Error::Corruption("SQLite overflow cell exceeds page".into()));
+            }
+            let mut buf = Vec::with_capacity(payload_len.min(1024 * 1024));
+            buf.extend_from_slice(&page[pos..pos + local_len]);
+            let mut ov_pg = u32::from_be_bytes(
+                page[pos + local_len..pos + local_len + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut ov_guard = 0usize;
+            while buf.len() < payload_len && ov_pg != 0 {
+                ov_guard += 1;
+                if ov_guard > 1_000_000 {
+                    return Err(Error::Corruption(
+                        "SQLite overflow chain loop detected".into(),
+                    ));
+                }
+                let ov_page = self.read_page(ov_pg)?;
+                let next_pg = u32::from_be_bytes(ov_page[0..4].try_into().unwrap());
+                let take = (payload_len - buf.len()).min(u - 4);
+                buf.extend_from_slice(&ov_page[4..4 + take]);
+                ov_pg = next_pg;
+            }
+            if buf.len() < payload_len {
+                return Err(Error::Corruption(
+                    "Truncated SQLite overflow payload chain".into(),
+                ));
+            }
+            Ok(buf)
+        }
+    }
+
     fn read_table_btree(&mut self, root_page: u32) -> Result<Vec<(i64, Vec<Value>)>> {
         let mut rows = Vec::new();
         let mut visited = HashSet::new();
         self.walk_table_page(root_page, &mut rows, &mut visited)?;
         Ok(rows)
+    }
+
+    /// Reads all records from a SQLite index B-tree (used for `WITHOUT ROWID` tables),
+    /// performing an in-order traversal over interior (`0x02`) and leaf (`0x0A`) pages.
+    fn read_index_btree(&mut self, root_page: u32) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        let mut visited = HashSet::new();
+        self.walk_index_page(root_page, &mut rows, &mut visited)?;
+        Ok(rows)
+    }
+
+    fn walk_index_page(
+        &mut self,
+        pgno: u32,
+        out: &mut Vec<Vec<Value>>,
+        visited: &mut HashSet<u32>,
+    ) -> Result<()> {
+        if !visited.insert(pgno) {
+            return Err(Error::Corruption(format!(
+                "Cycle detected in SQLite index B-tree at page {}",
+                pgno
+            )));
+        }
+        let page = self.read_page(pgno)?;
+        let hdr_off = if pgno == 1 { 100usize } else { 0usize };
+        if hdr_off + 8 > page.len() {
+            return Err(Error::Corruption("Truncated SQLite B-tree page".into()));
+        }
+        let page_type = page[hdr_off];
+        let cell_count = u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
+        let u = self.usable_size;
+        let max_local = ((u - 12) * 64 / 255) - 23;
+        let min_local = ((u - 12) * 32 / 255) - 23;
+
+        match page_type {
+            0x02 => {
+                // Interior index B-tree page: each cell holds a left_child pointer AND a full key/row record!
+                if hdr_off + 12 > page.len() {
+                    return Err(Error::Corruption(
+                        "Truncated interior index B-tree header".into(),
+                    ));
+                }
+                let right_most =
+                    u32::from_be_bytes(page[hdr_off + 8..hdr_off + 12].try_into().unwrap());
+                let ptr_start = hdr_off + 12;
+                for i in 0..cell_count {
+                    let p_off = ptr_start + i * 2;
+                    if p_off + 2 > page.len() {
+                        return Err(Error::Corruption(
+                            "Invalid SQLite index cell pointer array".into(),
+                        ));
+                    }
+                    let mut pos = u16::from_be_bytes([page[p_off], page[p_off + 1]]) as usize;
+                    if pos + 4 > page.len() {
+                        return Err(Error::Corruption(
+                            "Invalid SQLite interior index cell offset".into(),
+                        ));
+                    }
+                    let left_child = u32::from_be_bytes(page[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    let (payload_len_u64, n1) = read_sqlite_varint(&page, pos)?;
+                    pos += n1;
+                    let payload = self.read_cell_payload(
+                        &page,
+                        pos,
+                        payload_len_u64 as usize,
+                        max_local,
+                        min_local,
+                    )?;
+                    let values = decode_sqlite_record(&payload, self.text_encoding)?;
+                    self.walk_index_page(left_child, out, visited)?;
+                    out.push(values);
+                }
+                self.walk_index_page(right_most, out, visited)?;
+            }
+            0x0A => {
+                // Leaf index B-tree page: each cell holds varint(payload_len) + payload (no rowid varint).
+                let ptr_start = hdr_off + 8;
+                for i in 0..cell_count {
+                    let p_off = ptr_start + i * 2;
+                    if p_off + 2 > page.len() {
+                        return Err(Error::Corruption(
+                            "Invalid SQLite leaf index cell pointer array".into(),
+                        ));
+                    }
+                    let mut pos = u16::from_be_bytes([page[p_off], page[p_off + 1]]) as usize;
+                    let (payload_len_u64, n1) = read_sqlite_varint(&page, pos)?;
+                    pos += n1;
+                    let payload = self.read_cell_payload(
+                        &page,
+                        pos,
+                        payload_len_u64 as usize,
+                        max_local,
+                        min_local,
+                    )?;
+                    let values = decode_sqlite_record(&payload, self.text_encoding)?;
+                    out.push(values);
+                }
+            }
+            other => {
+                return Err(Error::Corruption(format!(
+                    "Expected SQLite index B-tree page (0x02/0x0a) for WITHOUT ROWID table, got 0x{:02x}",
+                    other
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn walk_table_page(
@@ -256,54 +423,18 @@ impl SqliteReader {
                     pos += n2;
                     let payload_len = payload_len_u64 as usize;
                     let rowid = rowid_u64 as i64;
-
-                    let payload = if payload_len <= max_local {
-                        if pos + payload_len > page.len() {
-                            return Err(Error::Corruption("SQLite leaf cell exceeds page".into()));
-                        }
-                        page[pos..pos + payload_len].to_vec()
-                    } else {
-                        let k = min_local + ((payload_len - min_local) % (u - 4));
-                        let local_len = if k <= max_local { k } else { min_local };
-                        if pos + local_len + 4 > page.len() {
-                            return Err(Error::Corruption(
-                                "SQLite overflow cell exceeds page".into(),
-                            ));
-                        }
-                        let mut buf = Vec::with_capacity(payload_len);
-                        buf.extend_from_slice(&page[pos..pos + local_len]);
-                        let mut ov_pg = u32::from_be_bytes(
-                            page[pos + local_len..pos + local_len + 4]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let mut ov_guard = 0usize;
-                        while buf.len() < payload_len && ov_pg != 0 {
-                            ov_guard += 1;
-                            if ov_guard > 1_000_000 {
-                                return Err(Error::Corruption(
-                                    "SQLite overflow chain loop detected".into(),
-                                ));
-                            }
-                            let ov_page = self.read_page(ov_pg)?;
-                            let next_pg = u32::from_be_bytes(ov_page[0..4].try_into().unwrap());
-                            let take = (payload_len - buf.len()).min(u - 4);
-                            buf.extend_from_slice(&ov_page[4..4 + take]);
-                            ov_pg = next_pg;
-                        }
-                        buf
-                    };
-
+                    let payload =
+                        self.read_cell_payload(&page, pos, payload_len, max_local, min_local)?;
                     let values = decode_sqlite_record(&payload, self.text_encoding)?;
                     out.push((rowid, values));
                 }
             }
             0x02 | 0x0A => {
-                // Index B-tree page (skip; we only walk table B-trees)
+                // Index B-tree page (handled via read_index_btree for WITHOUT ROWID tables)
             }
             other => {
                 return Err(Error::InvalidData(format!(
-                    "Unsupported SQLite B-tree page type 0x{:02x} (WITHOUT ROWID tables are not supported yet)",
+                    "Unsupported SQLite B-tree page type 0x{:02x}",
                     other
                 )));
             }
@@ -470,6 +601,9 @@ struct ParsedSqliteTable {
     checks: Vec<CheckConstraint>,
     foreign_keys: Vec<ForeignKeyDef>,
     rowid_alias_col: Option<usize>,
+    without_rowid: bool,
+    /// Ordered PRIMARY KEY column names (used to remap WITHOUT ROWID records into table column order).
+    pk_columns: Vec<String>,
 }
 
 struct ParsedSqliteIndex {
@@ -694,9 +828,9 @@ fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
 /// Per SQLite rules, only a single-column PRIMARY KEY whose declared type is exact `INTEGER`
 /// (case-insensitive, no length modifier, and not `DESC`) aliases the rowid.
 fn find_sqlite_rowid_alias_col(sql: &str) -> Option<String> {
-    let open = sql.find('(')?;
-    let close = find_matching_paren(sql, open)?;
-    let body = &sql[open + 1..close];
+    let clean = strip_sql_comments(sql);
+    let (open, close) = find_create_table_body_parens(&clean)?;
+    let body = &clean[open + 1..close];
     let items = split_top_level_commas(body);
 
     let mut exact_integer_cols: Vec<String> = Vec::new();
@@ -831,38 +965,221 @@ fn reconcile_sqlite_rowid_alias(
     rowid_alias_col
 }
 
+/// Strips `-- ...` line comments and `/* ... */` block comments outside quoted literals/identifiers.
+fn strip_sql_comments(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let ch = sql[i..].chars().next().unwrap();
+        if in_single {
+            out.push(ch);
+            if ch == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    out.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            i += ch.len_utf8();
+        } else if in_double {
+            out.push(ch);
+            if ch == '"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    out.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+            i += ch.len_utf8();
+        } else if ch == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push(' ');
+        } else if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                i = bytes.len();
+            }
+            out.push(' ');
+        } else {
+            if ch == '\'' {
+                in_single = true;
+            } else if ch == '"' {
+                in_double = true;
+            }
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Finds the top-level column-list `(...)` span in a comment-stripped CREATE TABLE statement,
+/// ignoring any parentheses inside quoted table names or string literals.
+fn find_create_table_body_parens(sql: &str) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'(' => {
+                    let close = find_matching_paren(sql, i)?;
+                    return Some((i, close));
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Detects whether a normalized SQLite CREATE TABLE statement ends with `WITHOUT ROWID`.
+fn is_sqlite_without_rowid(sql: &str) -> bool {
+    let clean = strip_sql_comments(sql);
+    let Some((_, close)) = find_create_table_body_parens(&clean) else {
+        return false;
+    };
+    let tail = &clean[close + 1..];
+    let words: Vec<String> = tail
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    words
+        .windows(2)
+        .any(|w| w[0] == "WITHOUT" && w[1] == "ROWID")
+}
+
+/// Extracts ordered, deduplicated PRIMARY KEY column names from a normalized SQLite CREATE TABLE DDL.
+fn extract_sqlite_pk_columns(sql: &str) -> Vec<String> {
+    let clean = strip_sql_comments(sql);
+    let Some((open, close)) = find_create_table_body_parens(&clean) else {
+        return Vec::new();
+    };
+    let body = &clean[open + 1..close];
+    let mut pk_cols: Vec<String> = Vec::new();
+    let mut push_unique = |name: String| {
+        if !pk_cols.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+            pk_cols.push(name);
+        }
+    };
+
+    for item in split_top_level_commas(body) {
+        let trimmed = item.trim();
+        let up = trimmed.to_ascii_uppercase();
+        let rest = if up.starts_with("CONSTRAINT ") {
+            let after = trimmed[11..].trim();
+            let split_at = after
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(after.len());
+            after[split_at..].trim()
+        } else {
+            trimmed
+        };
+        let rest_up = rest.to_ascii_uppercase();
+
+        if rest_up.starts_with("PRIMARY KEY") {
+            if let Some(p0) = rest.find('(') {
+                if let Some(p1) = find_matching_paren(rest, p0) {
+                    for part in split_top_level_commas(&rest[p0 + 1..p1]) {
+                        let (cname, _) = split_first_ident(&part);
+                        if !cname.is_empty() {
+                            push_unique(cname);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if rest_up.starts_with("UNIQUE")
+            || rest_up.starts_with("CHECK")
+            || rest_up.starts_with("FOREIGN KEY")
+        {
+            continue;
+        }
+        let (col_name, after_name) = split_first_ident(rest);
+        if !col_name.is_empty() && after_name.to_ascii_uppercase().contains("PRIMARY KEY") {
+            push_unique(col_name);
+        }
+    }
+    pk_cols
+}
+
 fn parse_sqlite_create_table(table_name: &str, root_page: u32, raw_sql: &str) -> Result<ParsedSqliteTable> {
     let sql = normalize_sqlite_ident_quotes(raw_sql);
-    let alias_name = find_sqlite_rowid_alias_col(&sql);
+    let without_rowid = is_sqlite_without_rowid(&sql);
+    let pk_columns = extract_sqlite_pk_columns(&sql);
+    let alias_name = if without_rowid {
+        None
+    } else {
+        find_sqlite_rowid_alias_col(&sql)
+    };
 
-    // Try SquishDB's own SQL parser first for 100% fidelity on standard DDL!
-    if let Ok(stmts) = crate::sql::parse_sql(&sql) {
-        if let Some(crate::sql::Statement::CreateTable {
-            mut columns,
-            check_constraints,
-            foreign_keys,
-            ..
-        }) = stmts.into_iter().next()
-        {
-            let rowid_alias_col = reconcile_sqlite_rowid_alias(&mut columns, alias_name.as_deref());
-            return Ok(ParsedSqliteTable {
-                name: table_name.to_string(),
-                root_page,
-                columns,
-                checks: check_constraints,
+    // Try SquishDB's own SQL parser first for 100% fidelity on standard DDL (non-WITHOUT-ROWID).
+    if !without_rowid {
+        if let Ok(stmts) = crate::sql::parse_sql(&sql) {
+            if let Some(crate::sql::Statement::CreateTable {
+                mut columns,
+                check_constraints,
                 foreign_keys,
-                rowid_alias_col,
-            });
+                ..
+            }) = stmts.into_iter().next()
+            {
+                let rowid_alias_col =
+                    reconcile_sqlite_rowid_alias(&mut columns, alias_name.as_deref());
+                return Ok(ParsedSqliteTable {
+                    name: table_name.to_string(),
+                    root_page,
+                    columns,
+                    checks: check_constraints,
+                    foreign_keys,
+                    rowid_alias_col,
+                    without_rowid: false,
+                    pk_columns,
+                });
+            }
         }
     }
 
     // Fallback lenient SQLite DDL parser (handles COLLATE, ON CONFLICT, untyped cols, etc.)
-    let open = sql
-        .find('(')
+    let clean_sql = strip_sql_comments(&sql);
+    let (open, close) = find_create_table_body_parens(&clean_sql)
         .ok_or_else(|| Error::Sql(format!("Cannot parse SQLite DDL for '{}': {}", table_name, raw_sql)))?;
-    let close = find_matching_paren(&sql, open)
-        .ok_or_else(|| Error::Sql(format!("Unmatched '(' in SQLite DDL for '{}'", table_name)))?;
-    let body = &sql[open + 1..close];
+    let body = &clean_sql[open + 1..close];
     let items = split_top_level_commas(body);
 
     let mut columns: Vec<ColumnDef> = Vec::new();
@@ -1036,6 +1353,21 @@ fn parse_sqlite_create_table(table_name: &str, root_page: u32, raw_sql: &str) ->
         )));
     }
 
+    if without_rowid {
+        // Every PRIMARY KEY column in a WITHOUT ROWID table is implicitly NOT NULL in SQLite.
+        for pkc in &pk_columns {
+            if let Some(c) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pkc)) {
+                c.not_null = true;
+            }
+        }
+        if pk_columns.len() > 1 {
+            // Composite PK uniqueness is preserved via a generated UNIQUE B-tree index.
+            for c in &mut columns {
+                c.primary_key = false;
+            }
+        }
+    }
+
     let rowid_alias_col = reconcile_sqlite_rowid_alias(&mut columns, alias_name.as_deref());
 
     Ok(ParsedSqliteTable {
@@ -1045,6 +1377,8 @@ fn parse_sqlite_create_table(table_name: &str, root_page: u32, raw_sql: &str) ->
         checks,
         foreign_keys,
         rowid_alias_col,
+        without_rowid,
+        pk_columns,
     })
 }
 
@@ -1355,30 +1689,66 @@ pub fn migrate_sqlite<P1: AsRef<Path>, P2: AsRef<Path>>(
         )?;
 
         let int_pk_col = tbl.rowid_alias_col;
-
-        let raw_rows = reader.read_table_btree(tbl.root_page)?;
         let num_cols = tbl.columns.len();
         let mut batch: Vec<Vec<Value>> = Vec::with_capacity(4096);
 
-        for (rowid, mut vals) in raw_rows {
-            if vals.len() < num_cols {
-                vals.resize(num_cols, Value::Null);
-            } else if vals.len() > num_cols {
-                vals.truncate(num_cols);
-            }
-            if let Some(pk_i) = int_pk_col {
-                if vals[pk_i].is_null() {
-                    vals[pk_i] = Value::Integer(rowid);
+        if tbl.without_rowid {
+            // In SQLite WITHOUT ROWID index B-trees, record fields are ordered as:
+            // [PK columns in declared PK order..., remaining non-PK columns in table definition order...].
+            let mut rec_to_tbl: Vec<usize> = Vec::with_capacity(num_cols);
+            for pkc in &tbl.pk_columns {
+                if let Some(ci) = tbl
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(pkc))
+                {
+                    if !rec_to_tbl.contains(&ci) {
+                        rec_to_tbl.push(ci);
+                    }
                 }
             }
-            for (c_i, col_def) in tbl.columns.iter().enumerate() {
-                let v = std::mem::replace(&mut vals[c_i], Value::Null);
-                vals[c_i] = coerce_sqlite_value(v, col_def.col_type);
+            for ci in 0..num_cols {
+                if !rec_to_tbl.contains(&ci) {
+                    rec_to_tbl.push(ci);
+                }
             }
-            batch.push(vals);
-            total_rows += 1;
-            if batch.len() >= 4096 {
-                db.bulk_insert(&tbl.name, std::mem::take(&mut batch))?;
+
+            let raw_recs = reader.read_index_btree(tbl.root_page)?;
+            for rec_vals in raw_recs {
+                let mut vals = vec![Value::Null; num_cols];
+                for (rec_i, v) in rec_vals.into_iter().enumerate() {
+                    if let Some(&tbl_i) = rec_to_tbl.get(rec_i) {
+                        vals[tbl_i] = coerce_sqlite_value(v, tbl.columns[tbl_i].col_type);
+                    }
+                }
+                batch.push(vals);
+                total_rows += 1;
+                if batch.len() >= 4096 {
+                    db.bulk_insert(&tbl.name, std::mem::take(&mut batch))?;
+                }
+            }
+        } else {
+            let raw_rows = reader.read_table_btree(tbl.root_page)?;
+            for (rowid, mut vals) in raw_rows {
+                if vals.len() < num_cols {
+                    vals.resize(num_cols, Value::Null);
+                } else if vals.len() > num_cols {
+                    vals.truncate(num_cols);
+                }
+                if let Some(pk_i) = int_pk_col {
+                    if vals[pk_i].is_null() {
+                        vals[pk_i] = Value::Integer(rowid);
+                    }
+                }
+                for (c_i, col_def) in tbl.columns.iter().enumerate() {
+                    let v = std::mem::replace(&mut vals[c_i], Value::Null);
+                    vals[c_i] = coerce_sqlite_value(v, col_def.col_type);
+                }
+                batch.push(vals);
+                total_rows += 1;
+                if batch.len() >= 4096 {
+                    db.bulk_insert(&tbl.name, std::mem::take(&mut batch))?;
+                }
             }
         }
         if !batch.is_empty() {
@@ -1393,6 +1763,26 @@ pub fn migrate_sqlite<P1: AsRef<Path>, P2: AsRef<Path>>(
     }
 
     let mut indexes_migrated = 0usize;
+    for tbl in &ordered_tables {
+        if tbl.without_rowid && tbl.pk_columns.len() > 1 {
+            let pk_idx_name = format!("idx_pk_{}", tbl.name.to_ascii_lowercase());
+            let desc = vec![false; tbl.pk_columns.len()];
+            if db
+                .create_index_full(
+                    &pk_idx_name,
+                    &tbl.name,
+                    tbl.pk_columns.clone(),
+                    desc,
+                    IndexKind::BTree,
+                    true,
+                    true,
+                )
+                .is_ok()
+            {
+                indexes_migrated += 1;
+            }
+        }
+    }
     for idx in &parsed_indexes {
         if db
             .create_index_full(

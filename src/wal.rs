@@ -63,6 +63,17 @@ pub enum WalOp {
         check_constraints: Vec<CheckConstraint>,
         foreign_keys: Vec<ForeignKeyDef>,
     },
+    /// v5: ALTER TABLE DROP COLUMN.
+    DropColumn {
+        table_name: String,
+        column_name: String,
+    },
+    /// v5: ALTER TABLE RENAME COLUMN.
+    RenameColumn {
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
 }
 
 impl WalOp {
@@ -210,6 +221,24 @@ impl WalOp {
                 for fk in foreign_keys {
                     write_foreign_key(fk, out);
                 }
+            }
+            WalOp::DropColumn {
+                table_name,
+                column_name,
+            } => {
+                out.push(13);
+                write_str(table_name, out);
+                write_str(column_name, out);
+            }
+            WalOp::RenameColumn {
+                table_name,
+                old_name,
+                new_name,
+            } => {
+                out.push(14);
+                write_str(table_name, out);
+                write_str(old_name, out);
+                write_str(new_name, out);
             }
         }
     }
@@ -368,6 +397,15 @@ impl WalOp {
                     foreign_keys,
                 })
             }
+            13 => Ok(WalOp::DropColumn {
+                table_name: read_str(buf, pos)?,
+                column_name: read_str(buf, pos)?,
+            }),
+            14 => Ok(WalOp::RenameColumn {
+                table_name: read_str(buf, pos)?,
+                old_name: read_str(buf, pos)?,
+                new_name: read_str(buf, pos)?,
+            }),
             _ => Err(Error::Corruption(format!("Unknown WAL op tag: {}", tag))),
         }
     }
@@ -416,12 +454,26 @@ impl WalFile {
     }
 
     pub fn read_frames(&mut self, current_gen: u64) -> Result<Vec<WalFrame>> {
+        let (frames, _) = self.read_frames_from(current_gen, 0)?;
+        Ok(frames)
+    }
+
+    /// Reads valid WAL frames starting at byte offset `start_offset`, returning `(frames, new_offset)`.
+    pub fn read_frames_from(
+        &mut self,
+        current_gen: u64,
+        start_offset: u64,
+    ) -> Result<(Vec<WalFrame>, u64)> {
         let f = match self.file.as_mut() {
             Some(f) => f,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), start_offset)),
         };
-        f.seek(SeekFrom::Start(0))?;
-        let mut raw = Vec::new();
+        let len = f.metadata()?.len();
+        if start_offset >= len {
+            return Ok((Vec::new(), start_offset));
+        }
+        f.seek(SeekFrom::Start(start_offset))?;
+        let mut raw = Vec::with_capacity((len - start_offset) as usize);
         f.read_to_end(&mut raw)?;
 
         let mut frames = Vec::new();
@@ -458,7 +510,7 @@ impl WalFile {
                 });
             }
         }
-        Ok(frames)
+        Ok((frames, start_offset + pos as u64))
     }
 
     pub fn append_frame(&mut self, base_generation: u64, ops: &[WalOp], sync: bool) -> Result<()> {
@@ -492,13 +544,20 @@ impl WalFile {
     }
 
     pub fn truncate(&mut self) -> Result<()> {
+        self.truncate_to(0)
+    }
+
+    pub fn truncate_to(&mut self, offset: u64) -> Result<()> {
         if self.read_only {
             return Ok(());
         }
         if let Some(f) = self.file.as_mut() {
-            f.set_len(0)?;
-            f.seek(SeekFrom::Start(0))?;
-            f.sync_data()?;
+            let cur = f.metadata()?.len();
+            if cur > offset || offset == 0 {
+                f.set_len(offset)?;
+                f.seek(SeekFrom::Start(offset))?;
+                f.sync_data()?;
+            }
         }
         Ok(())
     }

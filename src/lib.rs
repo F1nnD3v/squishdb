@@ -258,6 +258,7 @@ pub struct Database {
     _lock: Option<OsFileLock>,
     read_only: bool,
     mvcc_sandbox: bool,
+    mvcc_managed: bool,
     storage: StorageFile,
     wal: WalFile,
     catalog: Catalog,
@@ -318,6 +319,7 @@ impl Database {
             _lock: Some(lock),
             read_only: true,
             mvcc_sandbox: false,
+            mvcc_managed: false,
             storage,
             wal,
             catalog,
@@ -358,6 +360,7 @@ impl Database {
             _lock: Some(lock),
             read_only: false,
             mvcc_sandbox: false,
+            mvcc_managed: false,
             storage,
             wal,
             catalog,
@@ -382,6 +385,120 @@ impl Database {
         }
 
         Ok(db)
+    }
+
+    /// Opens a writable canonical database handle coordinated by cross-process MVCC.
+    /// Holds a **shared** OS lock on `<db>.lock` (so multiple `SharedDatabase` processes can
+    /// open the same database simultaneously while excluding legacy single-writer `Database::open`),
+    /// and skips unlocked checkpoint/WAL-removal in `Drop`.
+    pub(crate) fn open_for_mvcc<P: AsRef<Path>>(
+        path: P,
+        options: DbOptions,
+    ) -> Result<(Self, u64)> {
+        let path_buf = path.as_ref().to_path_buf();
+        let lock = OsFileLock::try_acquire(&path_buf, false)?;
+        let (storage, catalog) = StorageFile::open(&path_buf)?;
+        let mut wal = WalFile::open(&path_buf)?;
+        let (frames, wal_offset) = wal.read_frames_from(storage.superblock.generation, 0)?;
+        if wal.file_len() > wal_offset {
+            wal.truncate_to(wal_offset)?;
+        }
+        let cache_cap = options.cache_pages;
+        let idx_cap = options.index_cache_blocks;
+        let pool = ParallelPool::new(options.parallel_workers);
+        let migrated = storage.migrated_from_version.is_some();
+
+        let mut db = Database {
+            path: path_buf,
+            _lock: Some(lock),
+            read_only: false,
+            mvcc_sandbox: false,
+            mvcc_managed: true,
+            storage,
+            wal,
+            catalog,
+            hot_buffers: HashMap::new(),
+            cache: PageCache::new(cache_cap),
+            index_cache: IndexBlockCache::new(idx_cap),
+            options,
+            pool,
+            foreign_keys_enabled: true,
+            active_tx: None,
+            next_internal_sp: 0,
+            dirty: migrated,
+        };
+
+        if !frames.is_empty() {
+            for frame in frames {
+                for op in frame.ops {
+                    db.apply_wal_op_in_memory(op)?;
+                }
+            }
+            db.dirty = true;
+        }
+
+        Ok((db, wal_offset))
+    }
+
+    /// Refreshes an MVCC-managed canonical `Database` from disk after another process commits,
+    /// checkpoints, or vacuums. Uses O(delta) WAL tail replay when superblock generation is unchanged.
+    pub(crate) fn sync_from_disk_mvcc(
+        &mut self,
+        wal_offset: &mut u64,
+        force_reload: bool,
+    ) -> Result<()> {
+        let disk_gen = StorageFile::read_latest_generation(&self.path)?;
+        let cur_wal_len = self.wal.file_len();
+        if force_reload
+            || disk_gen != self.storage.superblock.generation
+            || cur_wal_len < *wal_offset
+        {
+            let (storage, catalog) = StorageFile::open(&self.path)?;
+            self.storage = storage;
+            self.catalog = catalog;
+            self.hot_buffers.clear();
+            self.cache.clear();
+            self.index_cache.clear();
+            let (frames, new_off) = self
+                .wal
+                .read_frames_from(self.storage.superblock.generation, 0)?;
+            for frame in frames {
+                for op in frame.ops {
+                    self.apply_wal_op_in_memory(op)?;
+                }
+            }
+            *wal_offset = new_off;
+            self.dirty = !self.hot_buffers.is_empty();
+        } else if cur_wal_len > *wal_offset {
+            let (frames, new_off) = self
+                .wal
+                .read_frames_from(self.storage.superblock.generation, *wal_offset)?;
+            for frame in frames {
+                for op in frame.ops {
+                    self.apply_wal_op_in_memory(op)?;
+                }
+            }
+            if cur_wal_len > new_off {
+                let _ = self.wal.truncate_to(new_off);
+            }
+            *wal_offset = new_off;
+            if !self.hot_buffers.is_empty() {
+                self.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wal_file_len(&self) -> u64 {
+        self.wal.file_len()
+    }
+
+    pub(crate) fn sync_wal_enabled(&self) -> bool {
+        self.options.sync_wal
+    }
+
+    pub(crate) fn superblock_generation(&self) -> u64 {
+        self.storage.superblock.generation
     }
 
     /// Creates a lightweight MVCC snapshot copy (called by `SharedDatabase`).
@@ -418,6 +535,7 @@ impl Database {
             _lock: None,
             read_only,
             mvcc_sandbox: true,
+            mvcc_managed: false,
             storage,
             wal,
             catalog,
@@ -706,6 +824,28 @@ impl Database {
                             foreign_keys,
                         });
                     }
+                    WalOp::DropColumn {
+                        table_name,
+                        column_name,
+                    } => {
+                        self.apply_drop_column_core(&table_name, &column_name, false)?;
+                        applied.push(WalOp::DropColumn {
+                            table_name,
+                            column_name,
+                        });
+                    }
+                    WalOp::RenameColumn {
+                        table_name,
+                        old_name,
+                        new_name,
+                    } => {
+                        self.apply_rename_column_core(&table_name, &old_name, &new_name)?;
+                        applied.push(WalOp::RenameColumn {
+                            table_name,
+                            old_name,
+                            new_name,
+                        });
+                    }
                 }
             }
 
@@ -951,6 +1091,21 @@ impl Database {
                         }
                         self.cache.clear();
                     }
+                }
+            }
+            WalOp::DropColumn {
+                table_name,
+                column_name,
+            } => {
+                let _ = self.apply_drop_column_core(&table_name, &column_name, true)?;
+            }
+            WalOp::RenameColumn {
+                table_name,
+                old_name,
+                new_name,
+            } => {
+                if self.find_table_idx(&table_name).is_some() {
+                    let _ = self.apply_rename_column_core(&table_name, &old_name, &new_name);
                 }
             }
         }
@@ -1443,6 +1598,269 @@ impl Database {
             }
         };
         self.record_wal_op(wal_op)?;
+        Ok(())
+    }
+
+    fn apply_drop_column_core(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> Result<Option<(String, String)>> {
+        let idx = self
+            .find_table_idx(table_name)
+            .ok_or_else(|| Error::Schema(format!("No such table: '{}'", table_name)))?;
+        let canonical_table = self.catalog.tables[idx].schema.name.clone();
+        let col_idx = match self.catalog.tables[idx].schema.col_index(column_name) {
+            Some(i) => i,
+            None => {
+                if if_exists {
+                    return Ok(None);
+                }
+                return Err(Error::Schema(format!(
+                    "No such column '{}' on table '{}'",
+                    column_name, canonical_table
+                )));
+            }
+        };
+        let canonical_col = self.catalog.tables[idx].schema.columns[col_idx].name.clone();
+
+        if self.catalog.tables[idx].schema.columns.len() <= 1 {
+            return Err(Error::Schema(format!(
+                "Cannot DROP the only column '{}' of table '{}'",
+                canonical_col, canonical_table
+            )));
+        }
+        if self.catalog.tables[idx].schema.columns[col_idx].primary_key {
+            return Err(Error::Schema(format!(
+                "Cannot DROP PRIMARY KEY column '{}.{}'",
+                canonical_table, canonical_col
+            )));
+        }
+        // Reject if any index references this column
+        for ix in &self.catalog.indexes {
+            if ix.table_name.eq_ignore_ascii_case(&canonical_table)
+                && ix
+                    .columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&canonical_col))
+            {
+                return Err(Error::Schema(format!(
+                    "Cannot DROP column '{}.{}' because index '{}' references it",
+                    canonical_table, canonical_col, ix.name
+                )));
+            }
+        }
+        // Reject if any FOREIGN KEY on this table or another table references this column
+        for fk in &self.catalog.tables[idx].schema.foreign_keys {
+            if fk
+                .columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&canonical_col))
+            {
+                return Err(Error::Schema(format!(
+                    "Cannot DROP column '{}.{}' because a FOREIGN KEY constraint references it",
+                    canonical_table, canonical_col
+                )));
+            }
+        }
+        for t in &self.catalog.tables {
+            for fk in &t.schema.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(&canonical_table)
+                    && fk
+                        .ref_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&canonical_col))
+                {
+                    return Err(Error::Schema(format!(
+                        "Cannot DROP column '{}.{}' because table '{}' references it via FOREIGN KEY",
+                        canonical_table, canonical_col, t.schema.name
+                    )));
+                }
+            }
+        }
+        // Reject if any CHECK constraint references this column
+        let schema_snapshot = self.catalog.tables[idx].schema.clone();
+        for chk in &schema_snapshot.check_constraints {
+            let expr = crate::sql::parse_expr_str(&chk.expr_sql)?;
+            let mut used = vec![false; schema_snapshot.columns.len()];
+            crate::sql::collect_expr_columns(&expr, &schema_snapshot, &mut used)?;
+            if used[col_idx] {
+                return Err(Error::Schema(format!(
+                    "Cannot DROP column '{}.{}' because CHECK constraint ({}) references it",
+                    canonical_table, canonical_col, chk.expr_sql
+                )));
+            }
+        }
+
+        // Materialize all live rows BEFORE mutating schema, strip the dropped column, and move
+        // them to hot_buffers so uncommitted txns, savepoints, and WAL replay stay atomic.
+        let mut live_rows = self.scan_all(&canonical_table)?;
+        for r in &mut live_rows {
+            if col_idx < r.values.len() {
+                r.values.remove(col_idx);
+            }
+        }
+
+        for p in &self.catalog.tables[idx].pages {
+            self.cache.invalidate(p.page_id);
+        }
+        self.catalog.tables[idx].pages.clear();
+        self.catalog.tables[idx].schema.columns.remove(col_idx);
+        self.catalog.tables[idx]
+            .schema
+            .cluster_by
+            .retain(|c| !c.eq_ignore_ascii_case(&canonical_col));
+
+        // Reset on-disk index blocks for remaining indexes on this table (live rows are in
+        // hot_buffers and will be re-indexed automatically on checkpoint).
+        for ix in &mut self.catalog.indexes {
+            if ix.table_name.eq_ignore_ascii_case(&canonical_table) {
+                ix.blocks.clear();
+                ix.btree_blocks.clear();
+                ix.pending_entries.clear();
+                ix.pending_btree.clear();
+                ix.removed_pages.clear();
+            }
+        }
+        self.index_cache.clear();
+
+        let key = canonical_table.to_ascii_lowercase();
+        if live_rows.is_empty() {
+            self.hot_buffers.remove(&key);
+        } else {
+            self.hot_buffers.insert(key, live_rows);
+        }
+
+        Ok(Some((canonical_table, canonical_col)))
+    }
+
+    pub fn drop_column(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> Result<bool> {
+        self.require_writable()?;
+        if let Some((canonical_table, canonical_col)) =
+            self.apply_drop_column_core(table_name, column_name, if_exists)?
+        {
+            self.record_wal_op(WalOp::DropColumn {
+                table_name: canonical_table,
+                column_name: canonical_col,
+            })?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn apply_rename_column_core(
+        &mut self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(String, String)> {
+        if new_name.trim().is_empty() {
+            return Err(Error::Schema("New column name cannot be empty".into()));
+        }
+        let idx = self
+            .find_table_idx(table_name)
+            .ok_or_else(|| Error::Schema(format!("No such table: '{}'", table_name)))?;
+        let canonical_table = self.catalog.tables[idx].schema.name.clone();
+        let col_idx = self.catalog.tables[idx]
+            .schema
+            .col_index(old_name)
+            .ok_or_else(|| {
+                Error::Schema(format!(
+                    "No such column '{}' on table '{}'",
+                    old_name, canonical_table
+                ))
+            })?;
+        let canonical_old = self.catalog.tables[idx].schema.columns[col_idx].name.clone();
+
+        if self.catalog.tables[idx]
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != col_idx && c.name.eq_ignore_ascii_case(new_name))
+        {
+            return Err(Error::Schema(format!(
+                "Column '{}' already exists on '{}'",
+                new_name, canonical_table
+            )));
+        }
+
+        // Rewrite CHECK constraint ASTs first so any failure leaves schema untouched.
+        let mut new_checks = Vec::with_capacity(
+            self.catalog.tables[idx].schema.check_constraints.len(),
+        );
+        for chk in &self.catalog.tables[idx].schema.check_constraints {
+            let mut expr = crate::sql::parse_expr_str(&chk.expr_sql)?;
+            crate::sql::rename_column_in_expr(&mut expr, &canonical_table, &canonical_old, new_name);
+            new_checks.push(CheckConstraint {
+                name: chk.name.clone(),
+                expr_sql: crate::sql::format_expr(&expr)?,
+            });
+        }
+
+        // Apply rename across column definition, CHECKs, CLUSTER BY, FKs (local & referencing), and indexes.
+        self.catalog.tables[idx].schema.columns[col_idx].name = new_name.to_string();
+        self.catalog.tables[idx].schema.check_constraints = new_checks;
+        for cb in &mut self.catalog.tables[idx].schema.cluster_by {
+            if cb.eq_ignore_ascii_case(&canonical_old) {
+                *cb = new_name.to_string();
+            }
+        }
+        for fk in &mut self.catalog.tables[idx].schema.foreign_keys {
+            for c in &mut fk.columns {
+                if c.eq_ignore_ascii_case(&canonical_old) {
+                    *c = new_name.to_string();
+                }
+            }
+        }
+        for t in &mut self.catalog.tables {
+            for fk in &mut t.schema.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(&canonical_table) {
+                    for rc in &mut fk.ref_columns {
+                        if rc.eq_ignore_ascii_case(&canonical_old) {
+                            *rc = new_name.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        for ix in &mut self.catalog.indexes {
+            if ix.table_name.eq_ignore_ascii_case(&canonical_table) {
+                for c in &mut ix.columns {
+                    if c.eq_ignore_ascii_case(&canonical_old) {
+                        *c = new_name.to_string();
+                    }
+                }
+                if let Some(first) = ix.columns.first() {
+                    ix.column_name = first.clone();
+                }
+            }
+        }
+
+        Ok((canonical_table, canonical_old))
+    }
+
+    pub fn rename_column(
+        &mut self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.require_writable()?;
+        let (canonical_table, canonical_old) =
+            self.apply_rename_column_core(table_name, old_name, new_name)?;
+        self.record_wal_op(WalOp::RenameColumn {
+            table_name: canonical_table,
+            old_name: canonical_old,
+            new_name: new_name.to_string(),
+        })?;
         Ok(())
     }
 
@@ -3045,17 +3463,17 @@ impl Database {
         Ok(rows)
     }
 
-    /// Parallel vectorized columnar streaming GROUP BY executor (PostgreSQL-style Gather +
-    /// Partial HashAggregate across worker threads!).
+    /// Parallel vectorized columnar streaming GROUP BY executor (single-column and multi-column,
+    /// PostgreSQL-style Gather + Partial HashAggregate across worker threads).
     pub fn vectorized_group_by(
         &mut self,
         table: &str,
-        group_col: Option<usize>,
+        group_cols: &[usize],
         agg_kinds: &[VecAggKind],
         vec_filter: Option<&VecFilter>,
         where_expr: Option<&Expr>,
         needed_cols: &[bool],
-    ) -> Result<(Vec<(Option<Value>, Vec<Value>)>, ScanMetrics)> {
+    ) -> Result<(Vec<(Vec<Value>, Vec<Value>)>, ScanMetrics)> {
         let idx = self
             .find_table_idx(table)
             .ok_or_else(|| Error::Schema(format!("No such table: '{}'", table)))?;
@@ -3096,7 +3514,7 @@ impl Database {
         }
 
         metrics.pages_scanned = candidate_indices.len();
-        let mut group_table = VectorGroupTable::new(group_col, agg_kinds.to_vec());
+        let mut group_table = VectorGroupTable::new(group_cols.to_vec(), agg_kinds.to_vec());
 
         // Parallel vectorized scan + partial aggregation across worker pool!
         let num_workers = self.pool.worker_count();
@@ -3110,7 +3528,7 @@ impl Database {
 
             let partials: Vec<Result<VectorGroupTable>> =
                 self.pool.execute_shards(eff_workers, |shard_id, total_shards| {
-                    let mut local = VectorGroupTable::new(group_col, agg_kinds.to_vec());
+                    let mut local = VectorGroupTable::new(group_cols.to_vec(), agg_kinds.to_vec());
                     let chunk = (cand_ref.len() + total_shards - 1) / total_shards;
                     let start = shard_id * chunk;
                     if start >= cand_ref.len() {
@@ -4139,10 +4557,15 @@ enum IndexPlan {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if !self.read_only && !self.mvcc_sandbox && self.active_tx.is_none() && self.dirty {
+        if !self.read_only
+            && !self.mvcc_sandbox
+            && !self.mvcc_managed
+            && self.active_tx.is_none()
+            && self.dirty
+        {
             let _ = self.checkpoint();
         }
-        if !self.mvcc_sandbox {
+        if !self.mvcc_sandbox && !self.mvcc_managed {
             self.wal.remove_if_empty();
         }
     }

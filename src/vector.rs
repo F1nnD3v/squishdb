@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::index::hash_value;
 use crate::types::{ColumnType, Value};
 
 /// Typed columnar array for a single column inside a decoded PAX page.
@@ -223,6 +224,85 @@ impl ColumnVector {
             _ => self.get_value(row).sql_cmp(target).is_eq(),
         }
     }
+
+    /// Zero-allocation equality check that treats NULL == NULL (for GROUP BY key matching).
+    #[inline]
+    pub fn eq_or_null_at(&self, row: usize, target: &Value) -> bool {
+        if !self.is_valid(row) {
+            return target.is_null();
+        }
+        if target.is_null() {
+            return false;
+        }
+        self.eq_value_at(row, target)
+    }
+
+    /// Zero-allocation deterministic hash matching `hash_value` (NULL hashes to a fixed sentinel).
+    #[inline]
+    pub fn hash_or_null_at(&self, row: usize) -> u64 {
+        const NULL_HASH: u64 = 0x9e37_79b9_7f4a_7c15;
+        if !self.is_valid(row) {
+            return NULL_HASH;
+        }
+        match self {
+            ColumnVector::Int64 { data, .. } => {
+                hash_value(&Value::Integer(data[row])).unwrap_or(NULL_HASH)
+            }
+            ColumnVector::Float64 { data, .. } => {
+                hash_value(&Value::Real(data[row])).unwrap_or(NULL_HASH)
+            }
+            ColumnVector::DictText { dict, codes, .. } => dict
+                .get(codes[row] as usize)
+                .map(|s| fnv1a_str_hash(s.as_bytes()))
+                .unwrap_or(NULL_HASH),
+            ColumnVector::Text { data, .. } => fnv1a_str_hash(data[row].as_bytes()),
+            ColumnVector::Blob { data, .. } => fnv1a_blob_hash(&data[row]),
+        }
+    }
+}
+
+#[inline]
+fn splitmix64_local(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn fnv1a_str_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    splitmix64_local(h) ^ 0xAAAA_BBBB_CCCC_DDDD
+}
+
+#[inline]
+fn fnv1a_blob_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    splitmix64_local(h) ^ 0xDDDD_EEEE_FFFF_1111
+}
+
+#[inline]
+fn combine_key_hash(acc: u64, h: u64) -> u64 {
+    splitmix64_local(acc ^ h.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
+
+#[inline]
+fn hash_value_tuple(vals: &[Value]) -> u64 {
+    const NULL_HASH: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut acc = 0x517c_c1b7_2722_0a95u64;
+    for v in vals {
+        let h = hash_value(v).unwrap_or(NULL_HASH);
+        acc = combine_key_hash(acc, h);
+    }
+    acc
 }
 
 /// Decoded columnar batch for a single PAX page (zero row transposition!).
@@ -621,33 +701,57 @@ impl<'a> BoundFilter<'a> {
     }
 }
 
-/// Streaming vectorized GROUP BY accumulator.
-/// When grouping by a `DictText` column, accumulates in an L1-cache-resident flat array indexed
-/// directly by `dict_code` (ZERO HashMap lookups & ZERO String hashing per row!) and merges once per page!
+/// Streaming vectorized GROUP BY accumulator (single-column AND multi-column!).
+/// - Single `DictText` column: accumulates in an L1-cache-resident flat array indexed directly by `dict_code`.
+/// - Multiple `DictText` columns with small combined cardinality (<= 4096): accumulates in a flat
+///   multi-dimensional code array with zero per-row hashing or String allocations.
+/// - General single or multi-column keys: hashes directly from `ColumnVector` slices without
+///   transposing rows or cloning Strings on hash hits.
 pub struct VectorGroupTable {
-    pub group_col: Option<usize>,
+    pub group_cols: Vec<usize>,
     pub agg_kinds: Vec<VecAggKind>,
     pub str_groups: HashMap<String, Vec<VecAggAcc>>,
     pub int_groups: HashMap<i64, Vec<VecAggAcc>>,
     pub null_group: Option<Vec<VecAggAcc>>,
     pub global_group: Option<Vec<VecAggAcc>>,
+    pub multi_groups: HashMap<u64, Vec<(Vec<Value>, Vec<VecAggAcc>)>>,
 }
 
 impl VectorGroupTable {
-    pub fn new(group_col: Option<usize>, agg_kinds: Vec<VecAggKind>) -> Self {
-        let global_group = if group_col.is_none() {
+    pub fn new(group_cols: Vec<usize>, agg_kinds: Vec<VecAggKind>) -> Self {
+        let global_group = if group_cols.is_empty() {
             Some(agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect())
         } else {
             None
         };
         VectorGroupTable {
-            group_col,
+            group_cols,
             agg_kinds,
             str_groups: HashMap::new(),
             int_groups: HashMap::new(),
             null_group: None,
             global_group,
+            multi_groups: HashMap::new(),
         }
+    }
+
+    fn merge_multi_entry(&mut self, key: Vec<Value>, accs: Vec<VecAggAcc>) {
+        let h = hash_value_tuple(&key);
+        let bucket = self.multi_groups.entry(h).or_default();
+        for (ek, eaccs) in bucket.iter_mut() {
+            if ek.len() == key.len()
+                && ek
+                    .iter()
+                    .zip(&key)
+                    .all(|(a, b)| a.sql_cmp(b).is_eq())
+            {
+                for (ga, la) in eaccs.iter_mut().zip(&accs) {
+                    ga.merge_from(la);
+                }
+                return;
+            }
+        }
+        bucket.push((key, accs));
     }
 
     pub fn ingest_batch(
@@ -693,8 +797,20 @@ impl VectorGroupTable {
             return;
         }
 
-        // ULTRA-FAST PATH: DictText grouping -> flat Vec indexed directly by dict_code!
-        if let Some(gc) = self.group_col {
+        // GLOBAL GROUPING (0 group columns)
+        if self.group_cols.is_empty() {
+            let accs = self.global_group.as_mut().unwrap();
+            for &row in &sel {
+                for (acc, &kind) in accs.iter_mut().zip(&self.agg_kinds) {
+                    acc.update_batch(kind, batch, row);
+                }
+            }
+            return;
+        }
+
+        // SINGLE-COLUMN GROUPING (preserves L1 flat-array DictText fast path!)
+        if self.group_cols.len() == 1 {
+            let gc = self.group_cols[0];
             if let Some(ColumnVector::DictText { dict, codes, valid }) = &batch.columns[gc] {
                 let dlen = dict.len();
                 let mut local: Vec<Vec<VecAggAcc>> = (0..dlen)
@@ -731,7 +847,6 @@ impl VectorGroupTable {
                     }
                 }
 
-                // Merge ONLY `dlen` (e.g. 10) local group accumulators into global HashMap once per page!
                 for code in 0..dlen {
                     if !touched[code] {
                         continue;
@@ -747,43 +862,172 @@ impl VectorGroupTable {
                 }
                 return;
             }
-        }
 
-        // General path: global, raw Text, or Int64 grouping
-        for &row in &sel {
-            let accs: &mut Vec<VecAggAcc> = match self.group_col {
-                None => self.global_group.as_mut().unwrap(),
-                Some(gc) => match &batch.columns[gc] {
-                    Some(ColumnVector::Text { data, valid }) => {
-                        if !valid.as_ref().map(|v| v[row]).unwrap_or(true) {
-                            self.null_group.get_or_insert_with(|| {
-                                self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect()
-                            })
-                        } else {
-                            let key = &data[row];
-                            if let Some(existing) = self.str_groups.get_mut(key.as_str()) {
-                                existing
+            if matches!(
+                batch.columns[gc],
+                Some(ColumnVector::Text { .. }) | Some(ColumnVector::Int64 { .. })
+            ) {
+                for &row in &sel {
+                    let accs: &mut Vec<VecAggAcc> = match &batch.columns[gc] {
+                        Some(ColumnVector::Text { data, valid }) => {
+                            if !valid.as_ref().map(|v| v[row]).unwrap_or(true) {
+                                self.null_group.get_or_insert_with(|| {
+                                    self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect()
+                                })
                             } else {
-                                let fresh: Vec<VecAggAcc> =
-                                    self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect();
-                                self.str_groups.entry(key.clone()).or_insert(fresh)
+                                let key = &data[row];
+                                if let Some(existing) = self.str_groups.get_mut(key.as_str()) {
+                                    existing
+                                } else {
+                                    let fresh: Vec<VecAggAcc> = self
+                                        .agg_kinds
+                                        .iter()
+                                        .map(|&k| VecAggAcc::new(k))
+                                        .collect();
+                                    self.str_groups.entry(key.clone()).or_insert(fresh)
+                                }
                             }
                         }
-                    }
-                    Some(ColumnVector::Int64 { data, valid }) => {
-                        if !valid.as_ref().map(|v| v[row]).unwrap_or(true) {
-                            self.null_group.get_or_insert_with(|| {
-                                self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect()
-                            })
-                        } else {
-                            let k = data[row];
-                            self.int_groups.entry(k).or_insert_with(|| {
-                                self.agg_kinds.iter().map(|&ak| VecAggAcc::new(ak)).collect()
-                            })
+                        Some(ColumnVector::Int64 { data, valid }) => {
+                            if !valid.as_ref().map(|v| v[row]).unwrap_or(true) {
+                                self.null_group.get_or_insert_with(|| {
+                                    self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect()
+                                })
+                            } else {
+                                let k = data[row];
+                                self.int_groups.entry(k).or_insert_with(|| {
+                                    self.agg_kinds.iter().map(|&ak| VecAggAcc::new(ak)).collect()
+                                })
+                            }
                         }
+                        _ => unreachable!(),
+                    };
+                    for (acc, &kind) in accs.iter_mut().zip(&self.agg_kinds) {
+                        acc.update_batch(kind, batch, row);
                     }
-                    _ => continue,
-                },
+                }
+                return;
+            }
+        }
+
+        // MULTI-COLUMN (or Float64/Blob single-column) VECTORIZED GROUPING
+        // Fast path: all group columns are DictText with small combined cardinality <= 4096
+        let mut dict_dims: Option<Vec<(&[String], &[u32], Option<&[bool]>, usize)>> =
+            Some(Vec::with_capacity(self.group_cols.len()));
+        let mut total_slots = 1usize;
+        for &gc in &self.group_cols {
+            if let Some(ColumnVector::DictText { dict, codes, valid }) = &batch.columns[gc] {
+                let stride = dict.len() + 1; // last slot reserved for NULL
+                match total_slots.checked_mul(stride) {
+                    Some(next) if next <= 4096 => {
+                        total_slots = next;
+                        dict_dims.as_mut().unwrap().push((
+                            dict.as_slice(),
+                            codes.as_slice(),
+                            valid.as_deref(),
+                            stride,
+                        ));
+                    }
+                    _ => {
+                        dict_dims = None;
+                        break;
+                    }
+                }
+            } else {
+                dict_dims = None;
+                break;
+            }
+        }
+
+        if let Some(dims) = dict_dims {
+            let mut local: Vec<Option<Vec<VecAggAcc>>> = vec![None; total_slots];
+            let mut touched: Vec<usize> = Vec::new();
+            for &row in &sel {
+                let mut flat_idx = 0usize;
+                for &(dict, codes, valid, stride) in &dims {
+                    let raw_c = codes[row] as usize;
+                    let c = if valid.map(|bm| !bm[row]).unwrap_or(false) || raw_c >= dict.len() {
+                        stride - 1
+                    } else {
+                        raw_c
+                    };
+                    flat_idx = flat_idx * stride + c;
+                }
+                if flat_idx >= total_slots {
+                    continue;
+                }
+                let slot = &mut local[flat_idx];
+                if slot.is_none() {
+                    touched.push(flat_idx);
+                    *slot = Some(self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect());
+                }
+                let accs = slot.as_mut().unwrap();
+                for (acc, &kind) in accs.iter_mut().zip(&self.agg_kinds) {
+                    acc.update_batch(kind, batch, row);
+                }
+            }
+            for flat_idx in touched {
+                let accs = local[flat_idx].take().unwrap();
+                let mut rem = flat_idx;
+                let mut key = vec![Value::Null; dims.len()];
+                for d_i in (0..dims.len()).rev() {
+                    let (dict, _, _, stride) = dims[d_i];
+                    let c = rem % stride;
+                    rem /= stride;
+                    if c < dict.len() {
+                        key[d_i] = Value::Text(dict[c].clone());
+                    }
+                }
+                self.merge_multi_entry(key, accs);
+            }
+            return;
+        }
+
+        // General multi-column path: zero-allocation direct ColumnVector hash + equality probe!
+        let gcols = self.group_cols.clone();
+        for &row in &sel {
+            let mut h = 0x517c_c1b7_2722_0a95u64;
+            for &gc in &gcols {
+                let ch = batch.columns[gc]
+                    .as_ref()
+                    .map(|cv| cv.hash_or_null_at(row))
+                    .unwrap_or(0x9e37_79b9_7f4a_7c15);
+                h = combine_key_hash(h, ch);
+            }
+            let bucket = self.multi_groups.entry(h).or_default();
+            let mut found_idx: Option<usize> = None;
+            for (bi, (ek, _)) in bucket.iter().enumerate() {
+                let mut eq = true;
+                for (k_pos, &gc) in gcols.iter().enumerate() {
+                    let matched = match &batch.columns[gc] {
+                        Some(cv) => cv.eq_or_null_at(row, &ek[k_pos]),
+                        None => ek[k_pos].is_null(),
+                    };
+                    if !matched {
+                        eq = false;
+                        break;
+                    }
+                }
+                if eq {
+                    found_idx = Some(bi);
+                    break;
+                }
+            }
+            let accs = if let Some(bi) = found_idx {
+                &mut bucket[bi].1
+            } else {
+                let mut key = Vec::with_capacity(gcols.len());
+                for &gc in &gcols {
+                    let v = batch.columns[gc]
+                        .as_ref()
+                        .map(|cv| cv.get_value(row))
+                        .unwrap_or(Value::Null);
+                    key.push(v);
+                }
+                let fresh: Vec<VecAggAcc> =
+                    self.agg_kinds.iter().map(|&k| VecAggAcc::new(k)).collect();
+                bucket.push((key, fresh));
+                &mut bucket.last_mut().unwrap().1
             };
             for (acc, &kind) in accs.iter_mut().zip(&self.agg_kinds) {
                 acc.update_batch(kind, batch, row);
@@ -826,25 +1070,38 @@ impl VectorGroupTable {
                 self.null_group = Some(o_null);
             }
         }
+        for (_, entries) in other.multi_groups {
+            for (key, accs) in entries {
+                self.merge_multi_entry(key, accs);
+            }
+        }
     }
 
-    pub fn into_groups(self) -> Vec<(Option<Value>, Vec<Value>)> {
+    pub fn into_groups(self) -> Vec<(Vec<Value>, Vec<Value>)> {
         let mut out = Vec::new();
         if let Some(g) = self.global_group {
-            out.push((None, g.iter().map(|a| a.finalize()).collect()));
+            out.push((Vec::new(), g.iter().map(|a| a.finalize()).collect()));
             return out;
         }
         for (k, accs) in self.str_groups {
-            out.push((Some(Value::Text(k)), accs.iter().map(|a| a.finalize()).collect()));
+            out.push((
+                vec![Value::Text(k)],
+                accs.iter().map(|a| a.finalize()).collect(),
+            ));
         }
         for (k, accs) in self.int_groups {
             out.push((
-                Some(Value::Integer(k)),
+                vec![Value::Integer(k)],
                 accs.iter().map(|a| a.finalize()).collect(),
             ));
         }
         if let Some(accs) = self.null_group {
-            out.push((Some(Value::Null), accs.iter().map(|a| a.finalize()).collect()));
+            out.push((vec![Value::Null], accs.iter().map(|a| a.finalize()).collect()));
+        }
+        for (_, entries) in self.multi_groups {
+            for (key, accs) in entries {
+                out.push((key, accs.iter().map(|a| a.finalize()).collect()));
+            }
         }
         out
     }

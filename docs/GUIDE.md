@@ -130,7 +130,7 @@ let mut durable_db = Database::open_with_options("durable.sqdb", opts)?;
 // Shared read-only connection (multiple readers can open the same file at once)
 let mut ro_db = Database::open_readonly("data.sqdb")?;
 
-// Multi-threaded multi-writer MVCC engine
+// Multi-threaded and cross-process multi-writer MVCC engine
 let shared = squishdb::SharedDatabase::open("concurrent.sqdb")?;
 let mut conn = shared.connect();
 ```
@@ -239,6 +239,10 @@ CREATE TABLE [IF NOT EXISTS] name (
 -- Metadata-only column add; older pages fill the default or NULL lazily on read
 ALTER TABLE name ADD [COLUMN] extra_col INTEGER DEFAULT 0 CHECK (extra_col >= 0);
 
+-- Drop or rename columns (updates CHECK, FOREIGN KEY, CLUSTER BY, and index metadata)
+ALTER TABLE name DROP [COLUMN] [IF EXISTS] extra_col;
+ALTER TABLE name RENAME [COLUMN] old_col TO new_col;
+
 -- Change clustering keys for the next VACUUM
 ALTER TABLE name CLUSTER BY (status, id);
 
@@ -272,9 +276,9 @@ LIMIT 50 OFFSET 0;
 Supported query syntax:
 
 - `SELECT [DISTINCT]`, column and table aliases, qualified wildcards (`t.*`), and quoted identifiers (`"a""b"`).
-- `INNER JOIN` and `LEFT [OUTER] JOIN` via hash equi-join or nested-loop fallback. `RIGHT`, `FULL`, `CROSS`, and `NATURAL` joins return an explicit error.
+- `INNER JOIN` and `LEFT [OUTER] JOIN` with cost-based join reordering, single-table predicate pushdown, multi-column smaller-side hash join, and nested-loop fallback. `RIGHT`, `FULL`, `CROSS`, and `NATURAL` joins return an explicit error.
 - `WHERE` with 3-valued `NULL` logic: `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN (...)`, `[NOT] IN (SELECT ...)`, `[NOT] LIKE`, and `CASE WHEN ... THEN ... ELSE ... END`.
-- `GROUP BY`, `HAVING`, `COUNT(*)`, `COUNT([DISTINCT] expr)`, `SUM`, `AVG`, `MIN`, and `MAX`.
+- Single-column and multi-column vectorized `GROUP BY`, `HAVING`, `COUNT(*)`, `COUNT([DISTINCT] expr)`, `SUM`, `AVG`, `MIN`, and `MAX`.
 - Window functions: `ROW_NUMBER()`, `RANK()`, `COUNT(*) OVER (...)`, `SUM(...) OVER (...)`, and `AVG(...) OVER (...)` with SQL `RANGE` peer-tie semantics when `ORDER BY` is present.
 - `ORDER BY ... [ASC|DESC]`, `LIMIT`, and `OFFSET`.
 - `EXPLAIN <SELECT>` to print the execution plan and pruning counts.
@@ -321,8 +325,10 @@ SquishDB picks the smallest lossless codec per column per 4,096-row page, so def
 | `mydb.sqdb` | Main database file: double-buffered A/B CRC32 superblocks, PAX-v4 pages, paged indexes, and catalog |
 | `mydb.sqdb-wal` | Write-ahead log for uncheckpointed mutations, truncated to 0 bytes on `CHECKPOINT` |
 | `mydb.sqdb.lock` | Cross-process OS lock sidecar (`LockFileEx` on Windows, `flock` on Unix) |
+| `mydb.sqdb-mvcc.log` | CRC32-framed cross-process MVCC commit log (created when using `SharedDatabase`) |
+| `mydb.sqdb-mvcc.commit.lock`, `mydb.sqdb-mvcc.snap.lock` | Cross-process MVCC commit and snapshot OS lock sidecars |
 
-Multiple processes can open a database concurrently with `Database::open_read_only`. A read-write `Database::open` takes an exclusive OS lock, and any second writer gets `Error::Busy` right away instead of racing on the file.
+Multiple processes can open a database concurrently with `Database::open_readonly`, or open concurrent read-write MVCC sessions across processes with `SharedDatabase::open`. A legacy single-writer `Database::open` takes an exclusive OS lock, and any second writer gets `Error::Busy` right away instead of racing on the file.
 
 Set `DbOptions { sync_wal: true, .. }` to fsync the WAL on every commit. Every superblock, PAX-v4 page, column chunk, and WAL frame carries a CRC32 checksum. After a crash, SquishDB replays every valid WAL frame and drops any torn tail frame.
 
