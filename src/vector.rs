@@ -791,6 +791,43 @@ impl VectorGroupTable {
         }
     }
 
+    pub fn merge_from(&mut self, other: VectorGroupTable) {
+        if let (Some(ref mut g_self), Some(ref g_other)) =
+            (&mut self.global_group, &other.global_group)
+        {
+            for (a, b) in g_self.iter_mut().zip(g_other) {
+                a.merge_from(b);
+            }
+        }
+        for (k, accs) in other.str_groups {
+            if let Some(existing) = self.str_groups.get_mut(&k) {
+                for (a, b) in existing.iter_mut().zip(&accs) {
+                    a.merge_from(b);
+                }
+            } else {
+                self.str_groups.insert(k, accs);
+            }
+        }
+        for (k, accs) in other.int_groups {
+            if let Some(existing) = self.int_groups.get_mut(&k) {
+                for (a, b) in existing.iter_mut().zip(&accs) {
+                    a.merge_from(b);
+                }
+            } else {
+                self.int_groups.insert(k, accs);
+            }
+        }
+        if let Some(o_null) = other.null_group {
+            if let Some(ref mut s_null) = self.null_group {
+                for (a, b) in s_null.iter_mut().zip(&o_null) {
+                    a.merge_from(b);
+                }
+            } else {
+                self.null_group = Some(o_null);
+            }
+        }
+    }
+
     pub fn into_groups(self) -> Vec<(Option<Value>, Vec<Value>)> {
         let mut out = Vec::new();
         if let Some(g) = self.global_group {

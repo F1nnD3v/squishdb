@@ -91,6 +91,45 @@ impl PartialEq for ColumnDef {
 
 impl Eq for ColumnDef {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FkAction {
+    NoAction = 0,
+    Restrict = 1,
+    Cascade = 2,
+    SetNull = 3,
+    SetDefault = 4,
+}
+
+impl FkAction {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(FkAction::NoAction),
+            1 => Ok(FkAction::Restrict),
+            2 => Ok(FkAction::Cascade),
+            3 => Ok(FkAction::SetNull),
+            4 => Ok(FkAction::SetDefault),
+            _ => Err(Error::Corruption(format!("Unknown FK action tag: {}", v))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub expr_sql: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub id: u32,
@@ -100,6 +139,10 @@ pub struct TableSchema {
     /// Optional sort-key columns (`CLUSTER BY (col1, col2)`) used to order rows inside
     /// PAX pages and during VACUUM for maximum RLE/Delta/Dictionary compression & zone-map pruning.
     pub cluster_by: Vec<String>,
+    /// Table-level and column-level CHECK constraints stored as canonical SQL expressions.
+    pub check_constraints: Vec<CheckConstraint>,
+    /// Foreign key constraints referencing parent tables.
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableSchema {

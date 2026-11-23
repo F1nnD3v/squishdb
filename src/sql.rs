@@ -1,9 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use crate::index::{hash_value, BloomFilter};
+use crate::index::{hash_value, BloomFilter, IndexKind, RangeBound};
 use crate::pax::ColumnZoneMap;
-use crate::types::{ColumnDef, ColumnType, Error, Result, Row, TableSchema, Value};
+use crate::types::{
+    CheckConstraint, ColumnDef, ColumnType, Error, FkAction, ForeignKeyDef, Result, Row,
+    TableSchema, Value,
+};
 use crate::vector::{VecAggKind, VecFilter};
 use crate::{Database, QueryResult};
 
@@ -160,6 +163,8 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnDef>,
         cluster_by: Vec<String>,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
     },
     AlterClusterBy {
         table: String,
@@ -168,6 +173,8 @@ pub enum Statement {
     AlterAddColumn {
         table: String,
         column: ColumnDef,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
     },
     DropTable {
         if_exists: bool,
@@ -177,7 +184,10 @@ pub enum Statement {
         if_not_exists: bool,
         name: String,
         table: String,
-        column: String,
+        columns: Vec<String>,
+        desc: Vec<bool>,
+        kind: IndexKind,
+        unique: bool,
     },
     DropIndex {
         if_exists: bool,
@@ -202,6 +212,15 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Savepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
+    RollbackToSavepoint {
+        name: String,
+    },
     Vacuum {
         table_sort: Option<(String, Vec<String>)>,
     },
@@ -210,6 +229,11 @@ pub enum Statement {
         path: String,
     },
     PragmaStats,
+    PragmaSet {
+        key: String,
+        value: String,
+    },
+    PragmaGet(String),
 }
 
 // ============================================================================
@@ -637,7 +661,73 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+    fn parse_fk_action(&mut self) -> Result<FkAction> {
+        if self.eat_kw("CASCADE") {
+            Ok(FkAction::Cascade)
+        } else if self.eat_kw("RESTRICT") {
+            Ok(FkAction::Restrict)
+        } else if self.eat_kw("SET") {
+            if self.eat_kw("NULL") {
+                Ok(FkAction::SetNull)
+            } else if self.eat_kw("DEFAULT") {
+                Ok(FkAction::SetDefault)
+            } else {
+                Err(Error::Sql(format!(
+                    "Expected NULL or DEFAULT after SET, got {:?}",
+                    self.peek()
+                )))
+            }
+        } else if self.eat_kw("NO") {
+            self.expect_kw("ACTION")?;
+            Ok(FkAction::NoAction)
+        } else {
+            Err(Error::Sql(format!(
+                "Expected referential action (CASCADE, RESTRICT, SET NULL, SET DEFAULT, NO ACTION), got {:?}",
+                self.peek()
+            )))
+        }
+    }
+
+    fn parse_fk_references(
+        &mut self,
+        name: Option<String>,
+        columns: Vec<String>,
+    ) -> Result<ForeignKeyDef> {
+        let ref_table = self.expect_ident()?;
+        let ref_columns = if matches!(self.peek(), Token::LParen) {
+            self.parse_ident_list_parens()?
+        } else {
+            Vec::new()
+        };
+        let mut on_delete = FkAction::NoAction;
+        let mut on_update = FkAction::NoAction;
+        while self.eat_kw("ON") {
+            if self.eat_kw("DELETE") {
+                on_delete = self.parse_fk_action()?;
+            } else if self.eat_kw("UPDATE") {
+                on_update = self.parse_fk_action()?;
+            } else {
+                return Err(Error::Sql(format!(
+                    "Expected DELETE or UPDATE after ON in FOREIGN KEY, got {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        Ok(ForeignKeyDef {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        })
+    }
+
+    fn parse_column_def(
+        &mut self,
+        checks_out: &mut Vec<CheckConstraint>,
+        fks_out: &mut Vec<ForeignKeyDef>,
+    ) -> Result<ColumnDef> {
         let col_name = self.expect_ident()?;
         let type_word = self.expect_ident()?;
         if matches!(self.peek(), Token::LParen) {
@@ -663,6 +753,11 @@ impl<'a> Parser<'a> {
         let mut unique = false;
         let mut default_value = None;
         loop {
+            let constraint_name = if self.eat_kw("CONSTRAINT") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
             if self.eat_kw("PRIMARY") {
                 self.expect_kw("KEY")?;
                 primary_key = true;
@@ -673,9 +768,32 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("UNIQUE") {
                 unique = true;
             } else if self.eat_kw("DEFAULT") {
-                let lit = self.parse_literal_value()?;
+                let lit = if matches!(self.peek(), Token::LParen) {
+                    self.next();
+                    let v = self.parse_literal_value()?;
+                    self.expect_tok(Token::RParen)?;
+                    v
+                } else {
+                    self.parse_literal_value()?
+                };
                 default_value = Some(lit);
+            } else if self.eat_kw("CHECK") {
+                self.expect_tok(Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect_tok(Token::RParen)?;
+                checks_out.push(CheckConstraint {
+                    name: constraint_name,
+                    expr_sql: format_expr(&expr),
+                });
+            } else if self.eat_kw("REFERENCES") {
+                let fk = self.parse_fk_references(constraint_name, vec![col_name.clone()])?;
+                fks_out.push(fk);
             } else if self.eat_kw("NULL") {
+            } else if constraint_name.is_some() {
+                return Err(Error::Sql(format!(
+                    "Expected constraint after CONSTRAINT name, got {:?}",
+                    self.peek()
+                )));
             } else {
                 break;
             }
@@ -746,7 +864,9 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         if self.eat_kw("CREATE") {
-            if self.eat_kw("INDEX") {
+            let unique_idx = self.eat_kw("UNIQUE");
+            if unique_idx || self.is_kw("INDEX") {
+                self.expect_kw("INDEX")?;
                 let mut if_not_exists = false;
                 if self.eat_kw("IF") {
                     self.expect_kw("NOT")?;
@@ -756,14 +876,47 @@ impl<'a> Parser<'a> {
                 let name = self.expect_ident()?;
                 self.expect_kw("ON")?;
                 let table = self.expect_ident()?;
+                let mut kind = IndexKind::BTree;
+                if self.eat_kw("USING") {
+                    let method = self.expect_ident()?;
+                    kind = match method.to_ascii_uppercase().as_str() {
+                        "BTREE" | "B_TREE" => IndexKind::BTree,
+                        "HASH" => IndexKind::Hash,
+                        other => {
+                            return Err(Error::Sql(format!(
+                                "Unsupported index method '{}' (use BTREE or HASH)",
+                                other
+                            )))
+                        }
+                    };
+                }
                 self.expect_tok(Token::LParen)?;
-                let column = self.expect_ident()?;
+                let mut columns: Vec<String> = Vec::new();
+                let mut desc = Vec::new();
+                loop {
+                    columns.push(self.expect_ident()?);
+                    let is_desc = if self.eat_kw("DESC") {
+                        true
+                    } else {
+                        let _ = self.eat_kw("ASC");
+                        false
+                    };
+                    desc.push(is_desc);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
                 self.expect_tok(Token::RParen)?;
                 return Ok(Statement::CreateIndex {
                     if_not_exists,
                     name,
                     table,
-                    column,
+                    columns,
+                    desc,
+                    kind,
+                    unique: unique_idx,
                 });
             }
             self.expect_kw("TABLE")?;
@@ -775,9 +928,83 @@ impl<'a> Parser<'a> {
             }
             let name = self.expect_ident()?;
             self.expect_tok(Token::LParen)?;
-            let mut columns = Vec::new();
+            let mut columns: Vec<ColumnDef> = Vec::new();
+            let mut check_constraints = Vec::new();
+            let mut foreign_keys = Vec::new();
             loop {
-                columns.push(self.parse_column_def()?);
+                if self.is_kw("CONSTRAINT")
+                    || self.is_kw("CHECK")
+                    || self.is_kw("FOREIGN")
+                    || self.is_kw("PRIMARY")
+                    || self.is_kw("UNIQUE")
+                {
+                    let cname = if self.eat_kw("CONSTRAINT") {
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    if self.eat_kw("CHECK") {
+                        self.expect_tok(Token::LParen)?;
+                        let expr = self.parse_expr()?;
+                        self.expect_tok(Token::RParen)?;
+                        check_constraints.push(CheckConstraint {
+                            name: cname,
+                            expr_sql: format_expr(&expr),
+                        });
+                    } else if self.eat_kw("FOREIGN") {
+                        self.expect_kw("KEY")?;
+                        let fk_cols = self.parse_ident_list_parens()?;
+                        self.expect_kw("REFERENCES")?;
+                        let fk = self.parse_fk_references(cname, fk_cols)?;
+                        foreign_keys.push(fk);
+                    } else if self.eat_kw("PRIMARY") {
+                        self.expect_kw("KEY")?;
+                        let pk_cols = self.parse_ident_list_parens()?;
+                        if pk_cols.len() == 1 {
+                            if let Some(c) = columns
+                                .iter_mut()
+                                .find(|c| c.name.eq_ignore_ascii_case(&pk_cols[0]))
+                            {
+                                c.primary_key = true;
+                            } else {
+                                return Err(Error::Schema(format!(
+                                    "Unknown PRIMARY KEY column '{}'",
+                                    pk_cols[0]
+                                )));
+                            }
+                        } else {
+                            return Err(Error::Sql(
+                                "Composite PRIMARY KEY is not supported; use UNIQUE index on multiple columns".into(),
+                            ));
+                        }
+                    } else if self.eat_kw("UNIQUE") {
+                        let u_cols = self.parse_ident_list_parens()?;
+                        if u_cols.len() == 1 {
+                            if let Some(c) = columns
+                                .iter_mut()
+                                .find(|c| c.name.eq_ignore_ascii_case(&u_cols[0]))
+                            {
+                                c.unique = true;
+                            } else {
+                                return Err(Error::Schema(format!(
+                                    "Unknown UNIQUE column '{}'",
+                                    u_cols[0]
+                                )));
+                            }
+                        } else {
+                            return Err(Error::Sql(
+                                "Use CREATE UNIQUE INDEX for multi-column uniqueness".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(Error::Sql(format!(
+                            "Unsupported table constraint starting with {:?}",
+                            self.peek()
+                        )));
+                    }
+                } else {
+                    columns.push(self.parse_column_def(&mut check_constraints, &mut foreign_keys)?);
+                }
                 if matches!(self.peek(), Token::Comma) {
                     self.next();
                 } else {
@@ -796,6 +1023,8 @@ impl<'a> Parser<'a> {
                 name,
                 columns,
                 cluster_by,
+                check_constraints,
+                foreign_keys,
             });
         }
 
@@ -804,8 +1033,15 @@ impl<'a> Parser<'a> {
             let table = self.expect_ident()?;
             if self.eat_kw("ADD") {
                 let _ = self.eat_kw("COLUMN");
-                let column = self.parse_column_def()?;
-                return Ok(Statement::AlterAddColumn { table, column });
+                let mut check_constraints = Vec::new();
+                let mut foreign_keys = Vec::new();
+                let column = self.parse_column_def(&mut check_constraints, &mut foreign_keys)?;
+                return Ok(Statement::AlterAddColumn {
+                    table,
+                    column,
+                    check_constraints,
+                    foreign_keys,
+                });
             }
             self.expect_kw("CLUSTER")?;
             self.expect_kw("BY")?;
@@ -929,7 +1165,40 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("ROLLBACK") {
             let _ = self.eat_kw("TRANSACTION");
+            if self.eat_kw("TO") {
+                let _ = self.eat_kw("SAVEPOINT");
+                let name = self.expect_ident()?;
+                return Ok(Statement::RollbackToSavepoint { name });
+            }
             return Ok(Statement::Rollback);
+        }
+        if self.eat_kw("SAVEPOINT") {
+            let name = self.expect_ident()?;
+            return Ok(Statement::Savepoint { name });
+        }
+        if self.eat_kw("RELEASE") {
+            let _ = self.eat_kw("SAVEPOINT");
+            let name = self.expect_ident()?;
+            return Ok(Statement::ReleaseSavepoint { name });
+        }
+        if self.eat_kw("SET") {
+            let key = self.expect_ident()?;
+            if matches!(self.peek(), Token::Eq) {
+                self.next();
+            } else {
+                let _ = self.eat_kw("TO");
+            }
+            let value = match self.next() {
+                Token::UInt(v) => v.to_string(),
+                Token::Ident(s) | Token::QuotedIdent(s) | Token::Str(s) => s,
+                other => {
+                    return Err(Error::Sql(format!(
+                        "Expected value after SET {}, got {:?}",
+                        key, other
+                    )))
+                }
+            };
+            return Ok(Statement::PragmaSet { key, value });
         }
         if self.eat_kw("VACUUM") {
             let table_sort = if self.is_ident_tok() {
@@ -968,8 +1237,25 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Backup { path });
         }
         if self.eat_kw("PRAGMA") {
-            self.expect_kw("STATS")?;
-            return Ok(Statement::PragmaStats);
+            let key = self.expect_ident()?;
+            if key.eq_ignore_ascii_case("STATS") {
+                return Ok(Statement::PragmaStats);
+            }
+            if matches!(self.peek(), Token::Eq) {
+                self.next();
+                let value = match self.next() {
+                    Token::UInt(v) => v.to_string(),
+                    Token::Ident(s) | Token::QuotedIdent(s) | Token::Str(s) => s,
+                    other => {
+                        return Err(Error::Sql(format!(
+                            "Expected value after PRAGMA {} =, got {:?}",
+                            key, other
+                        )))
+                    }
+                };
+                return Ok(Statement::PragmaSet { key, value });
+            }
+            return Ok(Statement::PragmaGet(key));
         }
 
         Err(Error::Sql(format!(
@@ -1558,9 +1844,319 @@ pub fn parse_sql_with_params(sql: &str, params: &[Value]) -> Result<Vec<Statemen
     Ok(stmts)
 }
 
+/// Parses a standalone SQL expression string (used for CHECK constraints).
+pub fn parse_expr_str(sql: &str) -> Result<Expr> {
+    let tokens = tokenize(sql)?;
+    let mut parser = Parser::new(tokens, &[]);
+    let expr = parser.parse_expr()?;
+    if !matches!(parser.peek(), Token::Eof) {
+        return Err(Error::Sql(format!(
+            "Unexpected trailing tokens in expression: {:?}",
+            parser.peek()
+        )));
+    }
+    Ok(expr)
+}
+
+/// Formats an `Expr` AST back into canonical SQL text (for persisting CHECK constraints).
+pub fn format_expr(expr: &Expr) -> String {
+    fn quote_ident(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+    fn fmt_val(v: &Value) -> String {
+        match v {
+            Value::Null => "NULL".into(),
+            Value::Integer(i) => i.to_string(),
+            Value::Real(f) => {
+                let s = f.to_string();
+                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                    format!("{}.0", s)
+                } else {
+                    s
+                }
+            }
+            Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Blob(b) => {
+                let mut out = String::from("X'");
+                for byte in b {
+                    out.push_str(&format!("{:02X}", byte));
+                }
+                out.push('\'');
+                out
+            }
+        }
+    }
+    match expr {
+        Expr::Literal(v) => fmt_val(v),
+        Expr::Column { table: None, name } => quote_ident(name),
+        Expr::Column {
+            table: Some(t),
+            name,
+        } => format!("{}.{}", quote_ident(t), quote_ident(name)),
+        Expr::UnaryNot(e) => format!("(NOT {})", format_expr(e)),
+        Expr::UnaryNeg(e) => format!("(-{})", format_expr(e)),
+        Expr::Binary { left, op, right } => {
+            let op_s = match op {
+                BinOp::Eq => "=",
+                BinOp::Ne => "!=",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                BinOp::And => "AND",
+                BinOp::Or => "OR",
+                BinOp::Like => "LIKE",
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+            };
+            format!("({} {} {})", format_expr(left), op_s, format_expr(right))
+        }
+        Expr::IsNull { expr, negated } => {
+            if *negated {
+                format!("({} IS NOT NULL)", format_expr(expr))
+            } else {
+                format!("({} IS NULL)", format_expr(expr))
+            }
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let kw = if *negated { "NOT BETWEEN" } else { "BETWEEN" };
+            format!(
+                "({} {} {} AND {})",
+                format_expr(expr),
+                kw,
+                format_expr(low),
+                format_expr(high)
+            )
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let kw = if *negated { "NOT IN" } else { "IN" };
+            let items: Vec<String> = list.iter().map(format_expr).collect();
+            format!("({} {} ({}))", format_expr(expr), kw, items.join(", "))
+        }
+        Expr::Case { whens, else_expr } => {
+            let mut s = String::from("(CASE");
+            for (c, v) in whens {
+                s.push_str(&format!(" WHEN {} THEN {}", format_expr(c), format_expr(v)));
+            }
+            if let Some(e) = else_expr {
+                s.push_str(&format!(" ELSE {}", format_expr(e)));
+            }
+            s.push_str(" END)");
+            s
+        }
+        _ => "1".into(),
+    }
+}
+
 // ============================================================================
 // Column analysis, Secondary Index Extraction, Zone-Map & Bloom Pruning
 // ============================================================================
+
+/// Conjunctive predicates extracted for a single column (for composite & range B-tree planning).
+#[derive(Debug, Clone)]
+pub struct ColumnPredicates {
+    /// Equality values (`col = v` or `col IN (v1, v2, ...)`).
+    pub eq_values: Option<Vec<Value>>,
+    pub range_lo: RangeBound,
+    pub range_hi: RangeBound,
+}
+
+impl Default for ColumnPredicates {
+    fn default() -> Self {
+        ColumnPredicates {
+            eq_values: None,
+            range_lo: RangeBound::Unbounded,
+            range_hi: RangeBound::Unbounded,
+        }
+    }
+}
+
+impl ColumnPredicates {
+    pub fn has_range(&self) -> bool {
+        !matches!(self.range_lo, RangeBound::Unbounded)
+            || !matches!(self.range_hi, RangeBound::Unbounded)
+    }
+
+    fn tighten_lo(&mut self, bound: RangeBound) {
+        self.range_lo = match (&self.range_lo, bound) {
+            (RangeBound::Unbounded, b) => b,
+            (RangeBound::Included(cur), RangeBound::Included(new)) => {
+                if new.sql_cmp(cur).is_gt() {
+                    RangeBound::Included(new)
+                } else {
+                    RangeBound::Included(cur.clone())
+                }
+            }
+            (RangeBound::Included(cur), RangeBound::Excluded(new)) => {
+                if !new.sql_cmp(cur).is_lt() {
+                    RangeBound::Excluded(new)
+                } else {
+                    RangeBound::Included(cur.clone())
+                }
+            }
+            (RangeBound::Excluded(cur), RangeBound::Included(new)) => {
+                if new.sql_cmp(cur).is_gt() {
+                    RangeBound::Included(new)
+                } else {
+                    RangeBound::Excluded(cur.clone())
+                }
+            }
+            (RangeBound::Excluded(cur), RangeBound::Excluded(new)) => {
+                if new.sql_cmp(cur).is_gt() {
+                    RangeBound::Excluded(new)
+                } else {
+                    RangeBound::Excluded(cur.clone())
+                }
+            }
+            (cur, RangeBound::Unbounded) => cur.clone(),
+        };
+    }
+
+    fn tighten_hi(&mut self, bound: RangeBound) {
+        self.range_hi = match (&self.range_hi, bound) {
+            (RangeBound::Unbounded, b) => b,
+            (RangeBound::Included(cur), RangeBound::Included(new)) => {
+                if new.sql_cmp(cur).is_lt() {
+                    RangeBound::Included(new)
+                } else {
+                    RangeBound::Included(cur.clone())
+                }
+            }
+            (RangeBound::Included(cur), RangeBound::Excluded(new)) => {
+                if !new.sql_cmp(cur).is_gt() {
+                    RangeBound::Excluded(new)
+                } else {
+                    RangeBound::Included(cur.clone())
+                }
+            }
+            (RangeBound::Excluded(cur), RangeBound::Included(new)) => {
+                if new.sql_cmp(cur).is_lt() {
+                    RangeBound::Included(new)
+                } else {
+                    RangeBound::Excluded(cur.clone())
+                }
+            }
+            (RangeBound::Excluded(cur), RangeBound::Excluded(new)) => {
+                if new.sql_cmp(cur).is_lt() {
+                    RangeBound::Excluded(new)
+                } else {
+                    RangeBound::Excluded(cur.clone())
+                }
+            }
+            (cur, RangeBound::Unbounded) => cur.clone(),
+        };
+    }
+}
+
+/// Extracts conjunctive equality, IN-list, and range predicates per column (lowercase key).
+pub fn extract_column_predicates(expr: &Expr) -> HashMap<String, ColumnPredicates> {
+    let mut map: HashMap<String, ColumnPredicates> = HashMap::new();
+    collect_col_preds(expr, &mut map);
+    map
+}
+
+fn collect_col_preds(expr: &Expr, map: &mut HashMap<String, ColumnPredicates>) {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_col_preds(left, map);
+            collect_col_preds(right, map);
+        }
+        Expr::Binary { left, op, right } => {
+            let (col_name, lit, cmp_op) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column { name, .. }, Expr::Literal(v)) if !v.is_null() => (name, v, *op),
+                (Expr::Literal(v), Expr::Column { name, .. }) if !v.is_null() => {
+                    let flipped = match op {
+                        BinOp::Eq => BinOp::Eq,
+                        BinOp::Lt => BinOp::Gt,
+                        BinOp::Le => BinOp::Ge,
+                        BinOp::Gt => BinOp::Lt,
+                        BinOp::Ge => BinOp::Le,
+                        _ => return,
+                    };
+                    (name, v, flipped)
+                }
+                _ => return,
+            };
+            let entry = map.entry(col_name.to_ascii_lowercase()).or_default();
+            match cmp_op {
+                BinOp::Eq => {
+                    match &mut entry.eq_values {
+                        None => entry.eq_values = Some(vec![lit.clone()]),
+                        Some(existing) => {
+                            existing.retain(|v| v.sql_cmp(lit).is_eq());
+                        }
+                    }
+                }
+                BinOp::Gt => entry.tighten_lo(RangeBound::Excluded(lit.clone())),
+                BinOp::Ge => entry.tighten_lo(RangeBound::Included(lit.clone())),
+                BinOp::Lt => entry.tighten_hi(RangeBound::Excluded(lit.clone())),
+                BinOp::Le => entry.tighten_hi(RangeBound::Included(lit.clone())),
+                _ => {}
+            }
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            if let (Expr::Column { name, .. }, Expr::Literal(lv), Expr::Literal(hv)) =
+                (expr.as_ref(), low.as_ref(), high.as_ref())
+            {
+                if !lv.is_null() && !hv.is_null() {
+                    let entry = map.entry(name.to_ascii_lowercase()).or_default();
+                    entry.tighten_lo(RangeBound::Included(lv.clone()));
+                    entry.tighten_hi(RangeBound::Included(hv.clone()));
+                }
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if let Expr::Column { name, .. } = expr.as_ref() {
+                let mut vals = Vec::new();
+                let mut all_lit = true;
+                for item in list {
+                    if let Expr::Literal(v) = item {
+                        if !v.is_null() {
+                            vals.push(v.clone());
+                        }
+                    } else {
+                        all_lit = false;
+                        break;
+                    }
+                }
+                if all_lit && !vals.is_empty() {
+                    let entry = map.entry(name.to_ascii_lowercase()).or_default();
+                    match &mut entry.eq_values {
+                        None => entry.eq_values = Some(vals),
+                        Some(existing) => {
+                            existing.retain(|ev| vals.iter().any(|nv| ev.sql_cmp(nv).is_eq()));
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 pub fn extract_index_candidates(expr: &Expr) -> Vec<(String, Vec<Value>)> {
     let mut out = Vec::new();
@@ -2920,9 +3516,15 @@ fn try_vectorized_group_by(
         .map(|(p, _)| p)
         .collect();
 
+    let parallel_note = if m.parallel_workers > 1 {
+        format!(" | PARALLEL (workers={})", m.parallel_workers)
+    } else {
+        String::new()
+    };
     let plan = format!(
-        "VECTORIZED COLUMNAR SCAN + STREAMING HASH AGGREGATE '{}' | total_pages={} | pruned: zonemap={} bloom={} | scanned={} -> {} groups",
+        "VECTORIZED COLUMNAR SCAN + STREAMING HASH AGGREGATE '{}'{} | total_pages={} | pruned: zonemap={} bloom={} | scanned={} -> {} groups",
         base_schema.name,
+        parallel_note,
         m.total_pages,
         m.pruned_by_zonemap,
         m.pruned_by_bloom,
@@ -3543,9 +4145,15 @@ fn execute_select_with_ctes(
                             sel_eff.where_clause.as_ref(),
                             proj,
                         )?;
+                        let parallel_note = if m.parallel_workers > 1 {
+                            format!(" | PARALLEL (workers={})", m.parallel_workers)
+                        } else {
+                            String::new()
+                        };
                         plan_notes.push(format!(
-                            "SCAN '{}' | total_pages={} | pruned: index={} zonemap={} bloom={} | scanned={} (cache_hits={}, idx_blocks={}){}",
+                            "SCAN '{}'{} | total_pages={} | pruned: index={} zonemap={} bloom={} | scanned={} (cache_hits={}, idx_blocks={}){}",
                             base_schema.name,
+                            parallel_note,
                             m.total_pages,
                             m.pruned_by_index,
                             m.pruned_by_zonemap,
@@ -3965,6 +4573,8 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
             name,
             columns,
             cluster_by,
+            check_constraints,
+            foreign_keys,
         } => {
             if if_not_exists && db.table_schema(&name).is_some() {
                 return Ok(QueryResult::Message(format!(
@@ -3972,7 +4582,7 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
                     name
                 )));
             }
-            db.create_table_clustered(&name, columns, cluster_by)?;
+            db.create_table_full(&name, columns, cluster_by, check_constraints, foreign_keys)?;
             Ok(QueryResult::Message(format!("Created table '{}'.", name)))
         }
         Statement::AlterClusterBy { table, cluster_by } => {
@@ -3983,9 +4593,14 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
                 table
             )))
         }
-        Statement::AlterAddColumn { table, column } => {
+        Statement::AlterAddColumn {
+            table,
+            column,
+            check_constraints,
+            foreign_keys,
+        } => {
             let cname = column.name.clone();
-            db.add_column(&table, column)?;
+            db.add_column_with_constraints(&table, column, check_constraints, foreign_keys)?;
             Ok(QueryResult::Message(format!(
                 "Added column '{}' to '{}'.",
                 cname, table
@@ -4005,12 +4620,16 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
             if_not_exists,
             name,
             table,
-            column,
+            columns,
+            desc,
+            kind,
+            unique,
         } => {
-            db.create_index(&name, &table, &column, if_not_exists)?;
+            let cols_display = columns.join(", ");
+            db.create_index_full(&name, &table, columns, desc, kind, unique, if_not_exists)?;
             Ok(QueryResult::Message(format!(
                 "Created index '{}' on {}({}).",
-                name, table, column
+                name, table, cols_display
             )))
         }
         Statement::DropIndex { if_exists, name } => {
@@ -4112,6 +4731,27 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
             db.rollback()?;
             Ok(QueryResult::Message("Transaction rolled back.".into()))
         }
+        Statement::Savepoint { name } => {
+            db.savepoint(&name)?;
+            Ok(QueryResult::Message(format!(
+                "Savepoint '{}' created.",
+                name
+            )))
+        }
+        Statement::ReleaseSavepoint { name } => {
+            db.release_savepoint(&name)?;
+            Ok(QueryResult::Message(format!(
+                "Savepoint '{}' released.",
+                name
+            )))
+        }
+        Statement::RollbackToSavepoint { name } => {
+            db.rollback_to_savepoint(&name)?;
+            Ok(QueryResult::Message(format!(
+                "Rolled back to savepoint '{}'.",
+                name
+            )))
+        }
         Statement::Vacuum { table_sort } => {
             if let Some((tbl, cols)) = table_sort {
                 db.set_cluster_by(&tbl, cols)?;
@@ -4125,11 +4765,65 @@ pub fn execute_statement(db: &mut Database, stmt: Statement) -> Result<QueryResu
         }
         Statement::Backup { path } => {
             db.backup_to(&path)?;
-            Ok(QueryResult::Message(format!("Backed up database to '{}'.", path)))
+            Ok(QueryResult::Message(format!(
+                "Backed up database to '{}'.",
+                path
+            )))
         }
         Statement::PragmaStats => {
             let stats = db.stats()?;
             Ok(QueryResult::Message(stats.format_report()))
+        }
+        Statement::PragmaSet { key, value } => {
+            let k = key.to_ascii_lowercase();
+            match k.as_str() {
+                "foreign_keys" => {
+                    let on = matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "on" | "1" | "true" | "yes"
+                    );
+                    db.set_foreign_keys_enabled(on);
+                    Ok(QueryResult::Message(format!(
+                        "foreign_keys = {}",
+                        if on { "ON" } else { "OFF" }
+                    )))
+                }
+                "threads" | "max_parallel_workers" | "max_parallel_workers_per_gather" => {
+                    let n: usize = value.parse().map_err(|_| {
+                        Error::Sql(format!("Invalid integer for {}: '{}'", key, value))
+                    })?;
+                    db.set_parallel_workers(n);
+                    Ok(QueryResult::Message(format!(
+                        "parallel_workers = {}",
+                        db.parallel_workers()
+                    )))
+                }
+                _ => Err(Error::Sql(format!("Unknown PRAGMA/SET option '{}'", key))),
+            }
+        }
+        Statement::PragmaGet(key) => {
+            let k = key.to_ascii_lowercase();
+            match k.as_str() {
+                "foreign_keys" => Ok(QueryResult::Rows {
+                    columns: vec!["foreign_keys".into()],
+                    rows: vec![vec![Value::Integer(if db.foreign_keys_enabled() {
+                        1
+                    } else {
+                        0
+                    })]],
+                }),
+                "threads" | "max_parallel_workers" | "max_parallel_workers_per_gather" => {
+                    Ok(QueryResult::Rows {
+                        columns: vec!["parallel_workers".into()],
+                        rows: vec![vec![Value::Integer(db.parallel_workers() as i64)]],
+                    })
+                }
+                "format_version" => Ok(QueryResult::Rows {
+                    columns: vec!["format_version".into()],
+                    rows: vec![vec![Value::Integer(db.format_version() as i64)]],
+                }),
+                _ => Err(Error::Sql(format!("Unknown PRAGMA '{}'", key))),
+            }
         }
     }
 }

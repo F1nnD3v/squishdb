@@ -2,10 +2,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::storage::{read_col_def, write_col_def};
+use crate::index::IndexKind;
+use crate::storage::{
+    read_check_constraint, read_col_def, read_foreign_key, write_check_constraint, write_col_def,
+    write_foreign_key,
+};
 use crate::types::{
     read_str, read_u8, read_uvarint, read_zigzag_varint, write_str, write_uvarint,
-    write_zigzag_varint, ColumnDef, Error, Result, Row, TableSchema, Value,
+    write_zigzag_varint, CheckConstraint, ColumnDef, Error, ForeignKeyDef, Result, Row,
+    TableSchema, Value,
 };
 
 const WAL_MAGIC: &[u8; 4] = b"SQWL";
@@ -40,12 +45,34 @@ pub enum WalOp {
         table_name: String,
         column: ColumnDef,
     },
+    /// v5: CREATE TABLE with CHECK constraints and FOREIGN KEY definitions.
+    CreateTableV5(TableSchema),
+    /// v5: CREATE [UNIQUE] INDEX with composite columns, ASC/DESC, and B-Tree or Hash kind.
+    CreateIndexV5 {
+        name: String,
+        table_name: String,
+        columns: Vec<String>,
+        desc: Vec<bool>,
+        kind: IndexKind,
+        unique: bool,
+    },
+    /// v5: ALTER TABLE ADD COLUMN carrying any column-level CHECK and FOREIGN KEY constraints.
+    AddColumnV5 {
+        table_name: String,
+        column: ColumnDef,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
+    },
 }
 
 impl WalOp {
     fn write_binary(&self, out: &mut Vec<u8>) {
         match self {
             WalOp::CreateTable(schema) => {
+                if !schema.check_constraints.is_empty() || !schema.foreign_keys.is_empty() {
+                    WalOp::CreateTableV5(schema.clone()).write_binary(out);
+                    return;
+                }
                 out.push(1);
                 write_uvarint(schema.id as u64, out);
                 write_str(&schema.name, out);
@@ -57,6 +84,28 @@ impl WalOp {
                 write_uvarint(schema.columns.len() as u64, out);
                 for c in &schema.columns {
                     write_col_def(c, out);
+                }
+            }
+            WalOp::CreateTableV5(schema) => {
+                out.push(10);
+                write_uvarint(schema.id as u64, out);
+                write_str(&schema.name, out);
+                write_zigzag_varint(schema.next_rowid, out);
+                write_uvarint(schema.cluster_by.len() as u64, out);
+                for cb in &schema.cluster_by {
+                    write_str(cb, out);
+                }
+                write_uvarint(schema.columns.len() as u64, out);
+                for c in &schema.columns {
+                    write_col_def(c, out);
+                }
+                write_uvarint(schema.check_constraints.len() as u64, out);
+                for chk in &schema.check_constraints {
+                    write_check_constraint(chk, out);
+                }
+                write_uvarint(schema.foreign_keys.len() as u64, out);
+                for fk in &schema.foreign_keys {
+                    write_foreign_key(fk, out);
                 }
             }
             WalOp::DropTable(name) => {
@@ -105,6 +154,25 @@ impl WalOp {
                 write_str(table_name, out);
                 write_str(column_name, out);
             }
+            WalOp::CreateIndexV5 {
+                name,
+                table_name,
+                columns,
+                desc,
+                kind,
+                unique,
+            } => {
+                out.push(11);
+                write_str(name, out);
+                write_str(table_name, out);
+                out.push(*kind as u8);
+                out.push(*unique as u8);
+                write_uvarint(columns.len() as u64, out);
+                for (i, c) in columns.iter().enumerate() {
+                    write_str(c, out);
+                    out.push(desc.get(i).copied().unwrap_or(false) as u8);
+                }
+            }
             WalOp::DropIndex(name) => {
                 out.push(7);
                 write_str(name, out);
@@ -124,6 +192,24 @@ impl WalOp {
                 out.push(9);
                 write_str(table_name, out);
                 write_col_def(column, out);
+            }
+            WalOp::AddColumnV5 {
+                table_name,
+                column,
+                check_constraints,
+                foreign_keys,
+            } => {
+                out.push(12);
+                write_str(table_name, out);
+                write_col_def(column, out);
+                write_uvarint(check_constraints.len() as u64, out);
+                for chk in check_constraints {
+                    write_check_constraint(chk, out);
+                }
+                write_uvarint(foreign_keys.len() as u64, out);
+                for fk in foreign_keys {
+                    write_foreign_key(fk, out);
+                }
             }
         }
     }
@@ -151,6 +237,42 @@ impl WalOp {
                     columns,
                     next_rowid,
                     cluster_by,
+                    check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
+                }))
+            }
+            10 => {
+                let id = read_uvarint(buf, pos)? as u32;
+                let name = read_str(buf, pos)?;
+                let next_rowid = read_zigzag_varint(buf, pos)?;
+                let cb_len = read_uvarint(buf, pos)? as usize;
+                let mut cluster_by = Vec::with_capacity(cb_len);
+                for _ in 0..cb_len {
+                    cluster_by.push(read_str(buf, pos)?);
+                }
+                let ncols = read_uvarint(buf, pos)? as usize;
+                let mut columns = Vec::with_capacity(ncols);
+                for _ in 0..ncols {
+                    columns.push(read_col_def(buf, pos)?);
+                }
+                let nchk = read_uvarint(buf, pos)? as usize;
+                let mut check_constraints = Vec::with_capacity(nchk);
+                for _ in 0..nchk {
+                    check_constraints.push(read_check_constraint(buf, pos)?);
+                }
+                let nfk = read_uvarint(buf, pos)? as usize;
+                let mut foreign_keys = Vec::with_capacity(nfk);
+                for _ in 0..nfk {
+                    foreign_keys.push(read_foreign_key(buf, pos)?);
+                }
+                Ok(WalOp::CreateTableV5(TableSchema {
+                    id,
+                    name,
+                    columns,
+                    next_rowid,
+                    cluster_by,
+                    check_constraints,
+                    foreign_keys,
                 }))
             }
             2 => Ok(WalOp::DropTable(read_str(buf, pos)?)),
@@ -187,6 +309,27 @@ impl WalOp {
                 table_name: read_str(buf, pos)?,
                 column_name: read_str(buf, pos)?,
             }),
+            11 => {
+                let name = read_str(buf, pos)?;
+                let table_name = read_str(buf, pos)?;
+                let kind = IndexKind::from_u8(read_u8(buf, pos)?)?;
+                let unique = read_u8(buf, pos)? != 0;
+                let clen = read_uvarint(buf, pos)? as usize;
+                let mut columns = Vec::with_capacity(clen);
+                let mut desc = Vec::with_capacity(clen);
+                for _ in 0..clen {
+                    columns.push(read_str(buf, pos)?);
+                    desc.push(read_u8(buf, pos)? != 0);
+                }
+                Ok(WalOp::CreateIndexV5 {
+                    name,
+                    table_name,
+                    columns,
+                    desc,
+                    kind,
+                    unique,
+                })
+            }
             7 => Ok(WalOp::DropIndex(read_str(buf, pos)?)),
             8 => {
                 let table_name = read_str(buf, pos)?;
@@ -204,6 +347,26 @@ impl WalOp {
                 let table_name = read_str(buf, pos)?;
                 let column = read_col_def(buf, pos)?;
                 Ok(WalOp::AddColumn { table_name, column })
+            }
+            12 => {
+                let table_name = read_str(buf, pos)?;
+                let column = read_col_def(buf, pos)?;
+                let nchk = read_uvarint(buf, pos)? as usize;
+                let mut check_constraints = Vec::with_capacity(nchk);
+                for _ in 0..nchk {
+                    check_constraints.push(read_check_constraint(buf, pos)?);
+                }
+                let nfk = read_uvarint(buf, pos)? as usize;
+                let mut foreign_keys = Vec::with_capacity(nfk);
+                for _ in 0..nfk {
+                    foreign_keys.push(read_foreign_key(buf, pos)?);
+                }
+                Ok(WalOp::AddColumnV5 {
+                    table_name,
+                    column,
+                    check_constraints,
+                    foreign_keys,
+                })
             }
             _ => Err(Error::Corruption(format!("Unknown WAL op tag: {}", tag))),
         }

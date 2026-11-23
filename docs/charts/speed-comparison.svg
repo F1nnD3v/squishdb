@@ -25,65 +25,66 @@
   <rect class="bar-sqlite" x="310" y="24" width="10" height="10" rx="2" />
   <text class="legend" x="326" y="33">SQLite C</text>
   <rect class="bar-squish" x="402" y="24" width="10" height="10" rx="2" />
-  <text class="legend" x="418" y="33">SquishDB v0.4</text>
+  <text class="legend" x="418" y="33">SquishDB v0.5</text>
 
-  <!-- Grid: x=205 (0 ms) to x=625 (25 ms), 16.8 px/ms -->
   <line class="grid" x1="205" y1="50" x2="205" y2="148" />
-  <line class="grid" x1="373" y1="50" x2="373" y2="148" />
-  <line class="grid" x1="541" y1="50" x2="541" y2="148" />
-  <line class="grid" x1="625" y1="50" x2="625" y2="148" />
+  <line class="grid" x1="373.0" y1="50" x2="373.0" y2="148" />
+  <line class="grid" x1="541.0" y1="50" x2="541.0" y2="148" />
+  <line class="grid" x1="625.0" y1="50" x2="625.0" y2="148" />
 
   <text class="axis" x="205" y="162" text-anchor="middle">0 ms</text>
-  <text class="axis" x="373" y="162" text-anchor="middle">10 ms</text>
-  <text class="axis" x="541" y="162" text-anchor="middle">20 ms</text>
-  <text class="axis" x="625" y="162" text-anchor="middle">25 ms</text>
+  <text class="axis" x="373.0" y="162" text-anchor="middle">10 ms</text>
+  <text class="axis" x="541.0" y="162" text-anchor="middle">20 ms</text>
+  <text class="axis" x="625.0" y="162" text-anchor="middle">25 ms</text>
 
   <!-- GROUP BY -->
   <text class="label" x="24" y="70">GROUP BY + aggregates</text>
-  <text class="sub" x="24" y="85">100k rows</text>
-  <rect class="bar-sqlite" x="205" y="57" width="290.8" height="13" rx="2" />
-  <text class="val" x="502" y="68">17.31 ms</text>
-  <rect class="bar-squish" x="205" y="74" width="64.7" height="13" rx="2" />
-  <text class="val-sq" x="276" y="85">3.85 ms (4.50x faster)</text>
+  <text class="sub" x="24" y="85">100k rows (parallel)</text>
+  <rect class="bar-sqlite" x="205" y="57" width="337.3" height="13" rx="2" />
+  <text class="val" x="548.8" y="68">20.07 ms</text>
+  <rect class="bar-squish" x="205" y="74" width="24.9" height="13" rx="2" />
+  <text class="val-sq" x="236.4" y="85">1.48 ms (13.53x faster)</text>
 
   <!-- UUID lookups -->
   <text class="label" x="24" y="121">200 random UUID lookups</text>
-  <text class="sub" x="24" y="136">40k rows, indexed</text>
-  <rect class="bar-sqlite" x="205" y="108" width="392.1" height="13" rx="2" />
-  <text class="val" x="604" y="119">23.34 ms</text>
-  <rect class="bar-squish" x="205" y="125" width="220.8" height="13" rx="2" />
-  <text class="val-sq" x="432" y="136">13.14 ms (1.78x faster)</text>
+  <text class="sub" x="24" y="136">40k rows, B-tree indexed</text>
+  <rect class="bar-sqlite" x="205" y="108" width="250.5" height="13" rx="2" />
+  <text class="val" x="462.0" y="119">14.91 ms</text>
+  <rect class="bar-squish" x="205" y="125" width="244.8" height="13" rx="2" />
+  <text class="val-sq" x="456.3" y="136">14.57 ms (1.02x faster)</text>
 
   <line class="sep" x1="24" y1="178" x2="736" y2="178" />
 
-  <!-- Bottom section: Insert throughput (log10 scale: 10^2 to 10^6.5 across 420 px -> 93.33 px/decade) -->
+  <!-- Bottom section: Insert throughput (log10 scale: 10^2 to 10^7 across 420 px -> 84 px/decade) -->
   <text class="title" x="24" y="206">SquishDB insert throughput (rows/sec, log scale, higher is better)</text>
 
   <line class="grid" x1="205" y1="220" x2="205" y2="326" />
-  <line class="grid" x1="298.3" y1="220" x2="298.3" y2="326" />
-  <line class="grid" x1="391.7" y1="220" x2="391.7" y2="326" />
-  <line class="grid" x1="485.0" y1="220" x2="485.0" y2="326" />
-  <line class="grid" x1="578.3" y1="220" x2="578.3" y2="326" />
+  <line class="grid" x1="289" y1="220" x2="289" y2="326" />
+  <line class="grid" x1="373" y1="220" x2="373" y2="326" />
+  <line class="grid" x1="457" y1="220" x2="457" y2="326" />
+  <line class="grid" x1="541" y1="220" x2="541" y2="326" />
+  <line class="grid" x1="625" y1="220" x2="625" y2="326" />
 
   <text class="axis" x="205" y="342" text-anchor="middle">100</text>
-  <text class="axis" x="298.3" y="342" text-anchor="middle">1k</text>
-  <text class="axis" x="391.7" y="342" text-anchor="middle">10k</text>
-  <text class="axis" x="485.0" y="342" text-anchor="middle">100k</text>
-  <text class="axis" x="578.3" y="342" text-anchor="middle">1M</text>
+  <text class="axis" x="289" y="342" text-anchor="middle">1k</text>
+  <text class="axis" x="373" y="342" text-anchor="middle">10k</text>
+  <text class="axis" x="457" y="342" text-anchor="middle">100k</text>
+  <text class="axis" x="541" y="342" text-anchor="middle">1M</text>
+  <text class="axis" x="625" y="342" text-anchor="middle">10M</text>
 
   <text class="label" x="24" y="238">Single-row fsync</text>
-  <rect class="bar-rate" x="205" y="226" width="92.2" height="14" rx="2" />
-  <text class="val-blue" x="304" y="237">973 rows/s</text>
+  <rect class="bar-rate" x="205" y="226" width="89.2" height="14" rx="2" />
+  <text class="val-blue" x="300.7" y="237">1,154 rows/s</text>
 
   <text class="label" x="24" y="264">Single-row buffered</text>
-  <rect class="bar-rate" x="205" y="252" width="287.1" height="14" rx="2" />
-  <text class="val-blue" x="499" y="263">119,181 rows/s</text>
+  <rect class="bar-rate" x="205" y="252" width="264.6" height="14" rx="2" />
+  <text class="val-blue" x="476.1" y="263">141,382 rows/s</text>
 
   <text class="label" x="24" y="290">Batched 1k/tx (fsync)</text>
-  <rect class="bar-rate" x="205" y="278" width="332.3" height="14" rx="2" />
-  <text class="val-blue" x="544" y="289">363,416 rows/s</text>
+  <rect class="bar-rate" x="205" y="278" width="304.0" height="14" rx="2" />
+  <text class="val-blue" x="515.5" y="289">415,983 rows/s</text>
 
-  <text class="label" x="24" y="316">Bulk PAX-v4 + checkpoint</text>
-  <rect class="bar-squish" x="205" y="304" width="403.2" height="14" rx="2" />
-  <text class="val-sq" x="615" y="315">2,088,886 rows/s</text>
+  <text class="label" x="24" y="316">Bulk PAX-v4 + parallel cp</text>
+  <rect class="bar-squish" x="205" y="304" width="363.9" height="14" rx="2" />
+  <text class="val-sq" x="575.4" y="315">2,150,926 rows/s</text>
 </svg>

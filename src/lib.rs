@@ -3,28 +3,45 @@ pub mod encoding;
 pub mod ffi;
 pub mod index;
 pub mod lock;
+pub mod mvcc;
+pub mod parallel;
 pub mod pax;
 pub mod rpc;
 pub mod sql;
+pub mod sqlite_import;
 pub mod storage;
 pub mod types;
 pub mod vector;
 pub mod wal;
 
+pub use mvcc::{MvccConnection, SharedDatabase};
+pub use sqlite_import::{migrate_sqlite, MigrateOptions, MigrationReport};
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::cache::PageCache;
-use crate::index::{hash_value, IndexBlockCache, IndexEntry, INDEX_BLOCK_ENTRIES};
-use crate::lock::{atomic_replace_file, OsFileLock};
-use crate::pax::{CompressionProfile, DEFAULT_PAGE_ROWS};
-use crate::sql::{
-    eval_bool_fast, eval_expr, execute_statement, extract_index_candidates, page_might_match,
-    parse_sql, parse_sql_with_params, EvalSchema, Expr,
+use crate::index::{
+    cmp_key_tuple, hash_key_tuple, hash_value, BTreeLeafEntry, BTreeScanSpec, IndexBlockCache,
+    IndexEntry, IndexKind, RangeBound, INDEX_BLOCK_ENTRIES,
 };
-use crate::storage::{Catalog, StorageFile, TableEntry};
-use crate::types::{ColumnDef, Error, Result, Row, TableSchema, Value};
+use crate::lock::{atomic_replace_file, OsFileLock};
+use crate::parallel::ParallelPool;
+use crate::pax::{encode_pax_page, CompressionProfile, DEFAULT_PAGE_ROWS};
+use crate::sql::{
+    eval_bool, eval_bool_fast, eval_expr, execute_statement, extract_column_predicates,
+    page_might_match, parse_expr_str, parse_sql, parse_sql_with_params, ColumnPredicates,
+    EvalSchema, Expr,
+};
+use crate::storage::{
+    read_pax_batch_from_file, read_pax_page_from_file, Catalog, StorageFile, TableEntry,
+    FORMAT_VERSION,
+};
+use crate::types::{
+    CheckConstraint, ColumnDef, Error, FkAction, ForeignKeyDef, Result, Row, TableSchema, Value,
+};
 use crate::vector::{ColumnBatch, ColumnVector, VecAggKind, VecFilter, VectorGroupTable};
 use crate::wal::{WalFile, WalOp};
 
@@ -40,6 +57,8 @@ pub struct DbOptions {
     pub cache_pages: usize,
     /// Number of decoded on-disk index leaf blocks kept in the LRU index cache.
     pub index_cache_blocks: usize,
+    /// Parallel worker threads (0 = auto-detect up to 8 cores, 1 = single-threaded).
+    pub parallel_workers: usize,
 }
 
 impl Default for DbOptions {
@@ -51,6 +70,7 @@ impl Default for DbOptions {
             auto_checkpoint_rows: DEFAULT_PAGE_ROWS * 4,
             cache_pages: 128,
             index_cache_blocks: 64,
+            parallel_workers: 0,
         }
     }
 }
@@ -75,6 +95,7 @@ pub struct ScanMetrics {
     pub cache_hits: usize,
     pub index_used: Option<String>,
     pub index_blocks_read: usize,
+    pub parallel_workers: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -217,16 +238,26 @@ impl DbStats {
     }
 }
 
+struct SavepointState {
+    name: String,
+    snapshot_catalog: Catalog,
+    snapshot_hot: HashMap<String, Vec<Row>>,
+    wal_ops_len: usize,
+}
+
 struct TxState {
     snapshot_catalog: Catalog,
     snapshot_hot: HashMap<String, Vec<Row>>,
     pending_wal_ops: Vec<WalOp>,
+    savepoints: Vec<SavepointState>,
+    implicit_savepoint_tx: bool,
 }
 
 pub struct Database {
     path: PathBuf,
-    _lock: OsFileLock,
+    _lock: Option<OsFileLock>,
     read_only: bool,
+    mvcc_sandbox: bool,
     storage: StorageFile,
     wal: WalFile,
     catalog: Catalog,
@@ -234,6 +265,8 @@ pub struct Database {
     cache: PageCache,
     index_cache: IndexBlockCache,
     options: DbOptions,
+    pool: ParallelPool,
+    foreign_keys_enabled: bool,
     active_tx: Option<TxState>,
     dirty: bool,
 }
@@ -269,7 +302,7 @@ impl Database {
     }
 
     /// Opens a read-only snapshot connection holding an OS-level **shared** lock.
-    /// Multiple processes/handles can open read-only concurrently without blocking each other!
+    /// Multiple processes/handles can open read-only concurrently without blocking each other.
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let lock = OsFileLock::try_acquire(&path_buf, false)?;
@@ -277,11 +310,13 @@ impl Database {
         let mut wal = WalFile::open_readonly(&path_buf)?;
         let frames = wal.read_frames(storage.superblock.generation)?;
         let options = DbOptions::default();
+        let pool = ParallelPool::new(options.parallel_workers);
 
         let mut db = Database {
             path: path_buf,
-            _lock: lock,
+            _lock: Some(lock),
             read_only: true,
+            mvcc_sandbox: false,
             storage,
             wal,
             catalog,
@@ -289,6 +324,8 @@ impl Database {
             cache: PageCache::new(options.cache_pages),
             index_cache: IndexBlockCache::new(options.index_cache_blocks),
             options,
+            pool,
+            foreign_keys_enabled: true,
             active_tx: None,
             dirty: false,
         };
@@ -311,11 +348,14 @@ impl Database {
         let frames = wal.read_frames(storage.superblock.generation)?;
         let cache_cap = options.cache_pages;
         let idx_cap = options.index_cache_blocks;
+        let pool = ParallelPool::new(options.parallel_workers);
+        let migrated = storage.migrated_from_version.is_some();
 
         let mut db = Database {
             path: path_buf,
-            _lock: lock,
+            _lock: Some(lock),
             read_only: false,
+            mvcc_sandbox: false,
             storage,
             wal,
             catalog,
@@ -323,8 +363,10 @@ impl Database {
             cache: PageCache::new(cache_cap),
             index_cache: IndexBlockCache::new(idx_cap),
             options,
+            pool,
+            foreign_keys_enabled: true,
             active_tx: None,
-            dirty: false,
+            dirty: migrated,
         };
 
         if !frames.is_empty() {
@@ -339,6 +381,379 @@ impl Database {
         Ok(db)
     }
 
+    /// Creates a lightweight MVCC snapshot copy (called by `SharedDatabase`).
+    pub(crate) fn snapshot_for_mvcc(
+        &self,
+    ) -> (PathBuf, Catalog, HashMap<String, Vec<Row>>, DbOptions, bool) {
+        (
+            self.path.clone(),
+            self.catalog.clone(),
+            self.hot_buffers.clone(),
+            self.options.clone(),
+            self.foreign_keys_enabled,
+        )
+    }
+
+    /// Opens an isolated MVCC sandbox against immutable on-disk PAX pages (no OS lock).
+    pub(crate) fn from_mvcc_snapshot(
+        path: PathBuf,
+        catalog: Catalog,
+        hot_buffers: HashMap<String, Vec<Row>>,
+        options: DbOptions,
+        foreign_keys_enabled: bool,
+        read_only: bool,
+    ) -> Result<Self> {
+        let (storage, _) = StorageFile::open_readonly(&path)?;
+        let wal = WalFile::open_readonly(&path)?;
+        let cache_cap = options.cache_pages;
+        let idx_cap = options.index_cache_blocks;
+        // Keep per-connection sandbox single-threaded by default to avoid oversubscribing CPU
+        // when many MVCC client threads run concurrently.
+        let pool = ParallelPool::new(1);
+        Ok(Database {
+            path,
+            _lock: None,
+            read_only,
+            mvcc_sandbox: true,
+            storage,
+            wal,
+            catalog,
+            hot_buffers,
+            cache: PageCache::new(cache_cap),
+            index_cache: IndexBlockCache::new(idx_cap),
+            options,
+            pool,
+            foreign_keys_enabled,
+            active_tx: None,
+            dirty: false,
+        })
+    }
+
+    pub(crate) fn take_tx_wal_ops(&mut self) -> Vec<WalOp> {
+        self.active_tx
+            .take()
+            .map(|t| t.pending_wal_ops)
+            .unwrap_or_default()
+    }
+
+    /// Atomically validates and applies a committing MVCC transaction's WAL ops onto the
+    /// canonical committed database, returning the final applied ops (with any remapped auto-rowids).
+    pub(crate) fn apply_mvcc_commit_ops(&mut self, ops: Vec<WalOp>) -> Result<Vec<WalOp>> {
+        self.require_writable()?;
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let saved_catalog = self.catalog.clone();
+        let saved_hot = self.hot_buffers.clone();
+        let saved_next_table_id = self.storage.superblock.next_table_id;
+
+        let res: Result<Vec<WalOp>> = (|| {
+            let mut applied = Vec::with_capacity(ops.len());
+            let mut deleted_parent_tables: Vec<(String, Vec<Row>)> = Vec::new();
+            for op in ops {
+                match op {
+                    WalOp::CreateTable(schema) | WalOp::CreateTableV5(schema) => {
+                        if self.find_table_idx(&schema.name).is_some() {
+                            return Err(Error::Busy(format!(
+                                "MVCC conflict: table '{}' already exists",
+                                schema.name
+                            )));
+                        }
+                        self.validate_table_constraints_ddl(&schema)?;
+                        let mut s = schema;
+                        s.id = self.storage.superblock.next_table_id;
+                        self.storage.superblock.next_table_id += 1;
+                        self.catalog.tables.push(TableEntry {
+                            schema: s.clone(),
+                            pages: Vec::new(),
+                        });
+                        applied.push(WalOp::CreateTableV5(s));
+                    }
+                    WalOp::DropTable(name) => {
+                        self.check_drop_table_fk(&name)?;
+                        let idx = self
+                            .find_table_idx(&name)
+                            .ok_or_else(|| Error::Schema(format!("No such table: '{}'", name)))?;
+                        let canonical = self.catalog.tables[idx].schema.name.clone();
+                        let key = canonical.to_ascii_lowercase();
+                        for p in &self.catalog.tables[idx].pages {
+                            self.cache.invalidate(p.page_id);
+                        }
+                        self.catalog.tables.remove(idx);
+                        self.hot_buffers.remove(&key);
+                        self.catalog
+                            .indexes
+                            .retain(|ix| !ix.table_name.eq_ignore_ascii_case(&canonical));
+                        applied.push(WalOp::DropTable(canonical));
+                    }
+                    WalOp::InsertRows {
+                        table_name,
+                        mut rows,
+                    } => {
+                        let idx = self.find_table_idx(&table_name).ok_or_else(|| {
+                            Error::Schema(format!("No such table: '{}'", table_name))
+                        })?;
+                        let schema = self.catalog.tables[idx].schema.clone();
+                        let pk_col = schema.integer_pk_col();
+                        let mut next_rowid = schema.next_rowid;
+                        // For rowid-only tables (no explicit INTEGER PRIMARY KEY), re-assign
+                        // colliding internal rowids so concurrent inserts both succeed cleanly!
+                        if pk_col.is_none() {
+                            for r in &mut rows {
+                                if r.rowid < next_rowid {
+                                    r.rowid = next_rowid;
+                                    next_rowid = next_rowid.saturating_add(1);
+                                } else {
+                                    next_rowid = r.rowid.saturating_add(1);
+                                }
+                            }
+                        } else {
+                            for r in &rows {
+                                if r.rowid >= next_rowid {
+                                    next_rowid = r.rowid.saturating_add(1);
+                                }
+                            }
+                        }
+                        self.check_row_constraints(&schema, &rows)?;
+                        self.check_unique_constraints(&schema.name, &schema, &rows, None)?;
+                        if self.foreign_keys_enabled {
+                            self.check_foreign_keys_on_write(&schema, &rows)?;
+                        }
+                        self.catalog.tables[idx].schema.next_rowid = next_rowid;
+                        let key = schema.name.to_ascii_lowercase();
+                        self.hot_buffers
+                            .entry(key)
+                            .or_default()
+                            .extend(rows.clone());
+                        applied.push(WalOp::InsertRows {
+                            table_name: schema.name,
+                            rows,
+                        });
+                    }
+                    WalOp::DeleteRowIds { table_name, rowids } => {
+                        let idx = self.find_table_idx(&table_name).ok_or_else(|| {
+                            Error::Schema(format!("No such table: '{}'", table_name))
+                        })?;
+                        let canonical = self.catalog.tables[idx].schema.name.clone();
+                        let set: HashSet<i64> = rowids.iter().copied().collect();
+                        let del_rows = if self.foreign_keys_enabled
+                            && !self.find_referencing_fks(&canonical).is_empty()
+                        {
+                            self.fetch_rows_by_ids(&canonical, &set)?
+                        } else {
+                            Vec::new()
+                        };
+                        self.mark_rowids_deleted_in_memory(&canonical, &set)?;
+                        if !del_rows.is_empty() {
+                            deleted_parent_tables.push((canonical.clone(), del_rows));
+                        }
+                        applied.push(WalOp::DeleteRowIds {
+                            table_name: canonical,
+                            rowids,
+                        });
+                    }
+                    WalOp::UpdateRows { table_name, rows } => {
+                        let idx = self.find_table_idx(&table_name).ok_or_else(|| {
+                            Error::Schema(format!("No such table: '{}'", table_name))
+                        })?;
+                        let schema = self.catalog.tables[idx].schema.clone();
+                        let old_ids: HashSet<i64> = rows.iter().map(|r| r.rowid).collect();
+                        self.check_row_constraints(&schema, &rows)?;
+                        self.check_unique_constraints(
+                            &schema.name,
+                            &schema,
+                            &rows,
+                            Some(&old_ids),
+                        )?;
+                        if self.foreign_keys_enabled {
+                            self.check_foreign_keys_on_write(&schema, &rows)?;
+                        }
+                        self.mark_rowids_deleted_in_memory(&schema.name, &old_ids)?;
+                        let key = schema.name.to_ascii_lowercase();
+                        self.hot_buffers
+                            .entry(key)
+                            .or_default()
+                            .extend(rows.clone());
+                        applied.push(WalOp::UpdateRows {
+                            table_name: schema.name,
+                            rows,
+                        });
+                    }
+                    WalOp::CreateIndex {
+                        name,
+                        table_name,
+                        column_name,
+                    } => {
+                        self.build_index_in_memory(
+                            &name,
+                            &table_name,
+                            &[column_name.clone()],
+                            &[false],
+                            IndexKind::Hash,
+                            false,
+                        )?;
+                        applied.push(WalOp::CreateIndex {
+                            name,
+                            table_name,
+                            column_name,
+                        });
+                    }
+                    WalOp::CreateIndexV5 {
+                        name,
+                        table_name,
+                        columns,
+                        desc,
+                        kind,
+                        unique,
+                    } => {
+                        self.build_index_in_memory(
+                            &name,
+                            &table_name,
+                            &columns,
+                            &desc,
+                            kind,
+                            unique,
+                        )?;
+                        applied.push(WalOp::CreateIndexV5 {
+                            name,
+                            table_name,
+                            columns,
+                            desc,
+                            kind,
+                            unique,
+                        });
+                    }
+                    WalOp::DropIndex(name) => {
+                        self.catalog
+                            .indexes
+                            .retain(|i| !i.name.eq_ignore_ascii_case(&name));
+                        applied.push(WalOp::DropIndex(name));
+                    }
+                    WalOp::SetClusterBy {
+                        table_name,
+                        cluster_by,
+                    } => {
+                        if let Some(idx) = self.find_table_idx(&table_name) {
+                            self.catalog.tables[idx].schema.cluster_by = cluster_by.clone();
+                        }
+                        applied.push(WalOp::SetClusterBy {
+                            table_name,
+                            cluster_by,
+                        });
+                    }
+                    WalOp::AddColumn { table_name, column } => {
+                        self.apply_wal_op_in_memory(WalOp::AddColumn {
+                            table_name: table_name.clone(),
+                            column: column.clone(),
+                        })?;
+                        applied.push(WalOp::AddColumn { table_name, column });
+                    }
+                    WalOp::AddColumnV5 {
+                        table_name,
+                        column,
+                        check_constraints,
+                        foreign_keys,
+                    } => {
+                        self.apply_wal_op_in_memory(WalOp::AddColumnV5 {
+                            table_name: table_name.clone(),
+                            column: column.clone(),
+                            check_constraints: check_constraints.clone(),
+                            foreign_keys: foreign_keys.clone(),
+                        })?;
+                        applied.push(WalOp::AddColumnV5 {
+                            table_name,
+                            column,
+                            check_constraints,
+                            foreign_keys,
+                        });
+                    }
+                }
+            }
+
+            // Post-commit FK integrity check: verify no remaining child row (including one
+            // inserted concurrently by another MVCC writer) still references a deleted parent key.
+            if self.foreign_keys_enabled {
+                for (parent_tbl, del_rows) in &deleted_parent_tables {
+                    self.verify_no_referencing_children(parent_tbl, del_rows)?;
+                }
+            }
+
+            self.wal.append_frame(
+                self.storage.superblock.generation,
+                &applied,
+                self.options.sync_wal,
+            )?;
+            Ok(applied)
+        })();
+
+        match res {
+            Ok(applied) => {
+                self.dirty = true;
+                self.maybe_auto_checkpoint()?;
+                Ok(applied)
+            }
+            Err(e) => {
+                self.catalog = saved_catalog;
+                self.hot_buffers = saved_hot;
+                self.storage.superblock.next_table_id = saved_next_table_id;
+                self.cache.clear();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.storage.superblock.version
+    }
+
+    pub fn migrated_from_version(&self) -> Option<u32> {
+        self.storage.migrated_from_version
+    }
+
+    /// Explicitly persists a forward format migration (e.g. v4 `SQSHDB04` -> v5 `SQSHDB05`)
+    /// atomically via the inactive A/B superblock slot. Returns `true` if upgraded.
+    pub fn upgrade_format(&mut self) -> Result<bool> {
+        self.require_writable()?;
+        if self.storage.superblock.version < FORMAT_VERSION
+            || self.storage.migrated_from_version.is_some()
+        {
+            self.checkpoint()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Writes a v4-format superblock+catalog snapshot for format forward-migration tests.
+    #[doc(hidden)]
+    pub fn write_v4_snapshot_for_test(&mut self) -> Result<()> {
+        self.require_writable()?;
+        self.checkpoint()?;
+        let profile = self.options.compression;
+        self.storage
+            .commit_catalog_v4_for_test(&self.catalog, profile)?;
+        self.wal.truncate()?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn set_foreign_keys_enabled(&mut self, enabled: bool) {
+        self.foreign_keys_enabled = enabled;
+    }
+
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.foreign_keys_enabled
+    }
+
+    pub fn set_parallel_workers(&mut self, workers: usize) {
+        self.options.parallel_workers = workers;
+        self.pool = ParallelPool::new(workers);
+    }
+
+    pub fn parallel_workers(&self) -> usize {
+        self.pool.worker_count()
+    }
+
     fn require_writable(&self) -> Result<()> {
         if self.read_only {
             Err(Error::Sql("Database is opened read-only".into()))
@@ -349,7 +764,7 @@ impl Database {
 
     fn apply_wal_op_in_memory(&mut self, op: WalOp) -> Result<()> {
         match op {
-            WalOp::CreateTable(schema) => {
+            WalOp::CreateTable(schema) | WalOp::CreateTableV5(schema) => {
                 if self.find_table_idx(&schema.name).is_none() {
                     if schema.id >= self.storage.superblock.next_table_id {
                         self.storage.superblock.next_table_id = schema.id + 1;
@@ -407,7 +822,32 @@ impl Database {
                     .iter()
                     .any(|i| i.name.eq_ignore_ascii_case(&name))
                 {
-                    let _ = self.build_index_in_memory(&name, &table_name, &column_name);
+                    let _ = self.build_index_in_memory(
+                        &name,
+                        &table_name,
+                        &[column_name],
+                        &[false],
+                        IndexKind::Hash,
+                        false,
+                    );
+                }
+            }
+            WalOp::CreateIndexV5 {
+                name,
+                table_name,
+                columns,
+                desc,
+                kind,
+                unique,
+            } => {
+                if !self
+                    .catalog
+                    .indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(&name))
+                {
+                    let _ = self
+                        .build_index_in_memory(&name, &table_name, &columns, &desc, kind, unique);
                 }
             }
             WalOp::DropIndex(name) => {
@@ -433,6 +873,38 @@ impl Database {
                         let fill = column.default_value.clone().unwrap_or(Value::Null);
                         let key = self.catalog.tables[idx].schema.name.to_ascii_lowercase();
                         self.catalog.tables[idx].schema.columns.push(column);
+                        if let Some(hot) = self.hot_buffers.get_mut(&key) {
+                            for r in hot.iter_mut() {
+                                r.values.push(fill.clone());
+                            }
+                        }
+                        self.cache.clear();
+                    }
+                }
+            }
+            WalOp::AddColumnV5 {
+                table_name,
+                column,
+                check_constraints,
+                foreign_keys,
+            } => {
+                if let Some(idx) = self.find_table_idx(&table_name) {
+                    if self.catalog.tables[idx]
+                        .schema
+                        .col_index(&column.name)
+                        .is_none()
+                    {
+                        let fill = column.default_value.clone().unwrap_or(Value::Null);
+                        let key = self.catalog.tables[idx].schema.name.to_ascii_lowercase();
+                        self.catalog.tables[idx].schema.columns.push(column);
+                        self.catalog.tables[idx]
+                            .schema
+                            .check_constraints
+                            .extend(check_constraints);
+                        self.catalog.tables[idx]
+                            .schema
+                            .foreign_keys
+                            .extend(foreign_keys);
                         if let Some(hot) = self.hot_buffers.get_mut(&key) {
                             for r in hot.iter_mut() {
                                 r.values.push(fill.clone());
@@ -483,8 +955,6 @@ impl Database {
         Ok(results)
     }
 
-    /// Execute one or more SQL statements with positional (`?`) or numbered (`$1`, `$2`, ...)
-    /// bound parameters. Values are injected directly into the AST without string interpolation.
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<Vec<QueryResult>> {
         let stmts = parse_sql_with_params(sql, params)?;
         let mut results = Vec::with_capacity(stmts.len());
@@ -495,7 +965,7 @@ impl Database {
     }
 
     // ========================================================================
-    // Transactions
+    // Transactions & Nested SAVEPOINTs
     // ========================================================================
 
     pub fn begin(&mut self) -> Result<()> {
@@ -507,6 +977,8 @@ impl Database {
             snapshot_catalog: self.catalog.clone(),
             snapshot_hot: self.hot_buffers.clone(),
             pending_wal_ops: Vec::new(),
+            savepoints: Vec::new(),
+            implicit_savepoint_tx: false,
         });
         Ok(())
     }
@@ -516,7 +988,7 @@ impl Database {
             .active_tx
             .take()
             .ok_or_else(|| Error::Sql("No active transaction".into()))?;
-        if !tx.pending_wal_ops.is_empty() {
+        if !tx.pending_wal_ops.is_empty() && !self.mvcc_sandbox {
             self.wal.append_frame(
                 self.storage.superblock.generation,
                 &tx.pending_wal_ops,
@@ -539,6 +1011,80 @@ impl Database {
         Ok(())
     }
 
+    pub fn savepoint(&mut self, name: &str) -> Result<()> {
+        self.require_writable()?;
+        if self.active_tx.is_none() {
+            self.active_tx = Some(TxState {
+                snapshot_catalog: self.catalog.clone(),
+                snapshot_hot: self.hot_buffers.clone(),
+                pending_wal_ops: Vec::new(),
+                savepoints: Vec::new(),
+                implicit_savepoint_tx: true,
+            });
+        }
+        let cat_snap = self.catalog.clone();
+        let hot_snap = self.hot_buffers.clone();
+        let tx = self.active_tx.as_mut().unwrap();
+        let wal_ops_len = tx.pending_wal_ops.len();
+        tx.savepoints.push(SavepointState {
+            name: name.to_string(),
+            snapshot_catalog: cat_snap,
+            snapshot_hot: hot_snap,
+            wal_ops_len,
+        });
+        Ok(())
+    }
+
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let should_commit = {
+            let tx = self
+                .active_tx
+                .as_mut()
+                .ok_or_else(|| Error::Sql(format!("No such savepoint: '{}'", name)))?;
+            let pos = tx
+                .savepoints
+                .iter()
+                .rposition(|sp| sp.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| Error::Sql(format!("No such savepoint: '{}'", name)))?;
+            tx.savepoints.truncate(pos);
+            tx.implicit_savepoint_tx && tx.savepoints.is_empty()
+        };
+        if should_commit {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        let (cat_snap, hot_snap) = {
+            let tx = self
+                .active_tx
+                .as_mut()
+                .ok_or_else(|| Error::Sql(format!("No such savepoint: '{}'", name)))?;
+            let pos = tx
+                .savepoints
+                .iter()
+                .rposition(|sp| sp.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| Error::Sql(format!("No such savepoint: '{}'", name)))?;
+            // Keep `pos` itself active on the stack (per SQL standard), discard inner savepoints.
+            tx.savepoints.truncate(pos + 1);
+            let sp = &tx.savepoints[pos];
+            tx.pending_wal_ops.truncate(sp.wal_ops_len);
+            (sp.snapshot_catalog.clone(), sp.snapshot_hot.clone())
+        };
+        self.catalog = cat_snap;
+        self.hot_buffers = hot_snap;
+        self.cache.clear();
+        Ok(())
+    }
+
+    pub fn has_savepoints(&self) -> bool {
+        self.active_tx
+            .as_ref()
+            .map(|t| !t.savepoints.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -557,7 +1103,7 @@ impl Database {
         }
         if let Some(ref mut tx) = self.active_tx {
             tx.pending_wal_ops.extend(ops);
-        } else {
+        } else if !self.mvcc_sandbox {
             self.wal.append_frame(
                 self.storage.superblock.generation,
                 &ops,
@@ -574,18 +1120,21 @@ impl Database {
     }
 
     fn maybe_auto_checkpoint(&mut self) -> Result<()> {
-        if self.active_tx.is_none() && self.total_hot_rows() >= self.options.auto_checkpoint_rows {
+        if !self.mvcc_sandbox
+            && self.active_tx.is_none()
+            && self.total_hot_rows() >= self.options.auto_checkpoint_rows
+        {
             self.checkpoint()?;
         }
         Ok(())
     }
 
     // ========================================================================
-    // DDL: Tables, Schema Evolution, Clustering, Paged Secondary Indexes
+    // DDL: Tables, CHECK & FOREIGN KEY validation, Schema Evolution, Indexes
     // ========================================================================
 
     pub fn create_table(&mut self, name: &str, columns: Vec<ColumnDef>) -> Result<()> {
-        self.create_table_clustered(name, columns, Vec::new())
+        self.create_table_full(name, columns, Vec::new(), Vec::new(), Vec::new())
     }
 
     pub fn create_table_clustered(
@@ -593,6 +1142,82 @@ impl Database {
         name: &str,
         columns: Vec<ColumnDef>,
         cluster_by: Vec<String>,
+    ) -> Result<()> {
+        self.create_table_full(name, columns, cluster_by, Vec::new(), Vec::new())
+    }
+
+    fn validate_table_constraints_ddl(&self, schema: &TableSchema) -> Result<()> {
+        // Validate CHECK expressions parse and only reference valid columns
+        let dummy_row = Row {
+            rowid: 0,
+            values: vec![Value::Null; schema.columns.len()],
+        };
+        for chk in &schema.check_constraints {
+            let expr = parse_expr_str(&chk.expr_sql)?;
+            let _ = eval_bool(&expr, schema, Some(&dummy_row))?;
+        }
+        // Validate FOREIGN KEY targets
+        for fk in &schema.foreign_keys {
+            for col in &fk.columns {
+                if schema.col_index(col).is_none() {
+                    return Err(Error::Schema(format!(
+                        "FOREIGN KEY column '{}' does not exist on table '{}'",
+                        col, schema.name
+                    )));
+                }
+            }
+            let parent_schema: &TableSchema = if fk.ref_table.eq_ignore_ascii_case(&schema.name) {
+                schema
+            } else {
+                self.table_schema(&fk.ref_table).ok_or_else(|| {
+                    Error::Schema(format!(
+                        "FOREIGN KEY references unknown parent table '{}'",
+                        fk.ref_table
+                    ))
+                })?
+            };
+            if fk.ref_columns.is_empty() {
+                if fk.columns.len() != 1 {
+                    return Err(Error::Schema(format!(
+                        "FOREIGN KEY on '{}' must specify parent columns when referencing >1 columns",
+                        schema.name
+                    )));
+                }
+                if !parent_schema.columns.iter().any(|c| c.primary_key) {
+                    return Err(Error::Schema(format!(
+                        "Referenced table '{}' has no PRIMARY KEY for implicit FOREIGN KEY",
+                        parent_schema.name
+                    )));
+                }
+            } else {
+                if fk.columns.len() != fk.ref_columns.len() {
+                    return Err(Error::Schema(format!(
+                        "FOREIGN KEY column count mismatch ({} vs {}) on table '{}'",
+                        fk.columns.len(),
+                        fk.ref_columns.len(),
+                        schema.name
+                    )));
+                }
+                for rc in &fk.ref_columns {
+                    if parent_schema.col_index(rc).is_none() {
+                        return Err(Error::Schema(format!(
+                            "FOREIGN KEY references unknown column '{}.{}'",
+                            parent_schema.name, rc
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn create_table_full(
+        &mut self,
+        name: &str,
+        columns: Vec<ColumnDef>,
+        cluster_by: Vec<String>,
+        check_constraints: Vec<CheckConstraint>,
+        mut foreign_keys: Vec<ForeignKeyDef>,
     ) -> Result<()> {
         self.require_writable()?;
         if columns.is_empty() {
@@ -609,25 +1234,66 @@ impl Database {
                 )));
             }
         }
+
+        // Resolve implicit parent PK column when REFERENCES parent_table omits `(col)`
+        for fk in &mut foreign_keys {
+            if fk.ref_columns.is_empty() {
+                let pk_name = if fk.ref_table.eq_ignore_ascii_case(name) {
+                    columns
+                        .iter()
+                        .find(|c| c.primary_key)
+                        .map(|c| c.name.clone())
+                } else {
+                    self.table_schema(&fk.ref_table).and_then(|ps| {
+                        ps.columns
+                            .iter()
+                            .find(|c| c.primary_key)
+                            .map(|c| c.name.clone())
+                    })
+                };
+                if let Some(pk) = pk_name {
+                    fk.ref_columns.push(pk);
+                }
+            }
+        }
+
         let id = self.storage.superblock.next_table_id;
-        self.storage.superblock.next_table_id += 1;
         let schema = TableSchema {
             id,
             name: name.to_string(),
             columns,
             next_rowid: 1,
             cluster_by,
+            check_constraints,
+            foreign_keys,
         };
+        self.validate_table_constraints_ddl(&schema)?;
+
+        self.storage.superblock.next_table_id += 1;
         self.catalog.tables.push(TableEntry {
             schema: schema.clone(),
             pages: Vec::new(),
         });
-        self.record_wal_op(WalOp::CreateTable(schema))?;
+        let wal_op = if schema.check_constraints.is_empty() && schema.foreign_keys.is_empty() {
+            WalOp::CreateTable(schema)
+        } else {
+            WalOp::CreateTableV5(schema)
+        };
+        self.record_wal_op(wal_op)?;
         Ok(())
     }
 
-    /// Instant O(1) schema evolution (`ALTER TABLE tbl ADD COLUMN ...`) without rewriting existing PAX pages!
-    pub fn add_column(&mut self, table_name: &str, mut column: ColumnDef) -> Result<()> {
+    pub fn add_column(&mut self, table_name: &str, column: ColumnDef) -> Result<()> {
+        self.add_column_with_constraints(table_name, column, Vec::new(), Vec::new())
+    }
+
+    pub fn add_column_with_constraints(
+        &mut self,
+        table_name: &str,
+        mut column: ColumnDef,
+        check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<ForeignKeyDef>,
+    ) -> Result<()> {
         self.require_writable()?;
         let idx = self
             .find_table_idx(table_name)
@@ -661,23 +1327,75 @@ impl Database {
                 "Cannot ADD COLUMN with NOT NULL and no DEFAULT to non-empty table".into(),
             ));
         }
+        let mut foreign_keys = foreign_keys;
+        let canonical_for_fk = self.catalog.tables[idx].schema.name.clone();
+        for fk in &mut foreign_keys {
+            if fk.ref_columns.is_empty() {
+                let pk_name = if fk.ref_table.eq_ignore_ascii_case(&canonical_for_fk) {
+                    self.catalog.tables[idx]
+                        .schema
+                        .columns
+                        .iter()
+                        .find(|c| c.primary_key)
+                        .map(|c| c.name.clone())
+                } else {
+                    self.table_schema(&fk.ref_table).and_then(|ps| {
+                        ps.columns
+                            .iter()
+                            .find(|c| c.primary_key)
+                            .map(|c| c.name.clone())
+                    })
+                };
+                if let Some(pk) = pk_name {
+                    fk.ref_columns.push(pk);
+                }
+            }
+        }
+
+        let mut candidate_schema = self.catalog.tables[idx].schema.clone();
+        candidate_schema.columns.push(column.clone());
+        candidate_schema
+            .check_constraints
+            .extend(check_constraints.clone());
+        candidate_schema.foreign_keys.extend(foreign_keys.clone());
+        self.validate_table_constraints_ddl(&candidate_schema)?;
+
+        if !check_constraints.is_empty() && existing_rows > 0 {
+            // Verify backfilled rows satisfy the new CHECK constraints
+            let fill = column.default_value.clone().unwrap_or(Value::Null);
+            let mut rows = self.scan_all(table_name)?;
+            for r in &mut rows {
+                r.values.push(fill.clone());
+            }
+            self.check_row_constraints(&candidate_schema, &rows)?;
+        }
+
         let canonical = self.catalog.tables[idx].schema.name.clone();
         let fill = column.default_value.clone().unwrap_or(Value::Null);
         let key = canonical.to_ascii_lowercase();
-        self.catalog.tables[idx].schema.columns.push(column.clone());
+        self.catalog.tables[idx].schema = candidate_schema;
         if let Some(hot) = self.hot_buffers.get_mut(&key) {
             for r in hot.iter_mut() {
                 r.values.push(fill.clone());
             }
         }
-        // Invalidate cached full pages of this table so they re-decode with the new column
         for p in &self.catalog.tables[idx].pages {
             self.cache.invalidate(p.page_id);
         }
-        self.record_wal_op(WalOp::AddColumn {
-            table_name: canonical,
-            column,
-        })?;
+        let wal_op = if check_constraints.is_empty() && foreign_keys.is_empty() {
+            WalOp::AddColumn {
+                table_name: canonical,
+                column,
+            }
+        } else {
+            WalOp::AddColumnV5 {
+                table_name: canonical,
+                column,
+                check_constraints,
+                foreign_keys,
+            }
+        };
+        self.record_wal_op(wal_op)?;
         Ok(())
     }
 
@@ -704,12 +1422,33 @@ impl Database {
         Ok(())
     }
 
+    fn check_drop_table_fk(&self, name: &str) -> Result<()> {
+        if !self.foreign_keys_enabled {
+            return Ok(());
+        }
+        for t in &self.catalog.tables {
+            if t.schema.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            for fk in &t.schema.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(name) {
+                    return Err(Error::InvalidData(format!(
+                        "FOREIGN KEY constraint failed: cannot DROP table '{}' because '{}' references it",
+                        name, t.schema.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         self.require_writable()?;
         let idx = self
             .find_table_idx(name)
             .ok_or_else(|| Error::Schema(format!("No such table: '{}'", name)))?;
         let canonical = self.catalog.tables[idx].schema.name.clone();
+        self.check_drop_table_fk(&canonical)?;
         let key = canonical.to_ascii_lowercase();
         for p in &self.catalog.tables[idx].pages {
             self.cache.invalidate(p.page_id);
@@ -727,47 +1466,160 @@ impl Database {
         &mut self,
         index_name: &str,
         table_name: &str,
-        column_name: &str,
+        columns: &[String],
+        desc: &[bool],
+        kind: IndexKind,
+        unique: bool,
     ) -> Result<()> {
         let t_idx = self
             .find_table_idx(table_name)
             .ok_or_else(|| Error::Schema(format!("No such table: '{}'", table_name)))?;
         let schema = self.catalog.tables[t_idx].schema.clone();
-        let col_idx = schema.col_index(column_name).ok_or_else(|| {
-            Error::Schema(format!(
-                "Unknown column '{}' on table '{}'",
-                column_name, schema.name
-            ))
-        })?;
+        if columns.is_empty() {
+            return Err(Error::Schema("Index must reference at least one column".into()));
+        }
+        let mut col_idxs = Vec::with_capacity(columns.len());
+        let mut canonical_cols = Vec::with_capacity(columns.len());
+        let mut needed = vec![false; schema.columns.len()];
+        for c in columns {
+            let ci = schema.col_index(c).ok_or_else(|| {
+                Error::Schema(format!("Unknown column '{}' on table '{}'", c, schema.name))
+            })?;
+            col_idxs.push(ci);
+            canonical_cols.push(schema.columns[ci].name.clone());
+            needed[ci] = true;
+        }
+        let norm_desc: Vec<bool> = if desc.len() == col_idxs.len() {
+            desc.to_vec()
+        } else {
+            vec![false; col_idxs.len()]
+        };
+
         let pages = self.catalog.tables[t_idx].pages.clone();
 
-        let mut needed = vec![false; schema.columns.len()];
-        needed[col_idx] = true;
-
-        let mut tuples: Vec<(u64, u64, u32)> = Vec::new();
-        for p in &pages {
-            if p.live_rows() == 0 {
-                continue;
-            }
-            let rows = self.storage.read_pax_page(&schema, p, Some(&needed))?;
-            for (slot, row) in rows.iter().enumerate() {
-                if p.is_deleted(slot as u32) {
-                    continue;
+        // Parallel page scan for index build when >= 4 pages
+        let extracted: Vec<Result<Vec<(Vec<Value>, u64, u32)>>> =
+            if pages.len() >= 4 && self.pool.worker_count() > 1 {
+                let path = self.path.clone();
+                let schema_ref = &schema;
+                let needed_ref = &needed;
+                let col_idxs_ref = &col_idxs;
+                self.pool.execute_indexed(&pages, |_, p| {
+                    if p.live_rows() == 0 {
+                        return Ok(Vec::new());
+                    }
+                    let mut f = File::open(&path)?;
+                    let rows = read_pax_page_from_file(&mut f, schema_ref, p, Some(needed_ref))?;
+                    let mut local = Vec::with_capacity(rows.len());
+                    for (slot, row) in rows.iter().enumerate() {
+                        if p.is_deleted(slot as u32) {
+                            continue;
+                        }
+                        let key: Vec<Value> = col_idxs_ref
+                            .iter()
+                            .map(|&ci| row.values[ci].clone())
+                            .collect();
+                        local.push((key, p.page_id, slot as u32));
+                    }
+                    Ok(local)
+                })
+            } else {
+                let mut out = Vec::with_capacity(pages.len());
+                for p in &pages {
+                    if p.live_rows() == 0 {
+                        out.push(Ok(Vec::new()));
+                        continue;
+                    }
+                    let rows = self.storage.read_pax_page(&schema, p, Some(&needed))?;
+                    let mut local = Vec::with_capacity(rows.len());
+                    for (slot, row) in rows.iter().enumerate() {
+                        if p.is_deleted(slot as u32) {
+                            continue;
+                        }
+                        let key: Vec<Value> =
+                            col_idxs.iter().map(|&ci| row.values[ci].clone()).collect();
+                        local.push((key, p.page_id, slot as u32));
+                    }
+                    out.push(Ok(local));
                 }
-                if let Some(h) = hash_value(&row.values[col_idx]) {
-                    tuples.push((h, p.page_id, slot as u32));
+                out
+            };
+
+        let mut all_tuples: Vec<BTreeLeafEntry> = Vec::new();
+        for res in extracted {
+            all_tuples.extend(res?);
+        }
+
+        // If UNIQUE index, validate existing persisted + hot rows have no duplicate non-NULL keys
+        if unique {
+            let mut seen: HashMap<u64, Vec<Vec<Value>>> = HashMap::new();
+            for (k, _, _) in &all_tuples {
+                if let Some(h) = hash_key_tuple(k) {
+                    let bucket = seen.entry(h).or_default();
+                    if bucket
+                        .iter()
+                        .any(|ex| cmp_key_tuple(ex, k, &norm_desc).is_eq())
+                    {
+                        return Err(Error::InvalidData(format!(
+                            "UNIQUE index '{}' failed on '{}': duplicate key {:?}",
+                            index_name, schema.name, k
+                        )));
+                    }
+                    bucket.push(k.clone());
+                }
+            }
+            let tbl_key = schema.name.to_ascii_lowercase();
+            if let Some(hot) = self.hot_buffers.get(&tbl_key) {
+                for r in hot {
+                    let k: Vec<Value> = col_idxs.iter().map(|&ci| r.values[ci].clone()).collect();
+                    if let Some(h) = hash_key_tuple(&k) {
+                        let bucket = seen.entry(h).or_default();
+                        if bucket
+                            .iter()
+                            .any(|ex| cmp_key_tuple(ex, &k, &norm_desc).is_eq())
+                        {
+                            return Err(Error::InvalidData(format!(
+                                "UNIQUE index '{}' failed on '{}': duplicate key {:?}",
+                                index_name, schema.name, k
+                            )));
+                        }
+                        bucket.push(k);
+                    }
                 }
             }
         }
-        tuples.sort_unstable();
-        tuples.dedup();
 
-        let mut entry = IndexEntry::new(
+        let mut entry = IndexEntry::new_composite(
             index_name.to_string(),
             schema.name.clone(),
-            schema.columns[col_idx].name.clone(),
+            canonical_cols,
+            norm_desc.clone(),
+            kind,
+            unique,
         );
-        entry.pending_entries = tuples;
+
+        match kind {
+            IndexKind::Hash => {
+                let mut hashes: Vec<(u64, u64, u32)> = Vec::with_capacity(all_tuples.len());
+                for (k, pid, slot) in all_tuples {
+                    if let Some(h) = hash_key_tuple(&k) {
+                        hashes.push((h, pid, slot));
+                    }
+                }
+                hashes.sort_unstable();
+                hashes.dedup();
+                entry.pending_entries = hashes;
+            }
+            IndexKind::BTree => {
+                all_tuples.sort_by(|a, b| {
+                    cmp_key_tuple(&a.0, &b.0, &norm_desc)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                entry.pending_btree = all_tuples;
+            }
+        }
+
         self.catalog.indexes.push(entry);
         Ok(())
     }
@@ -777,6 +1629,27 @@ impl Database {
         index_name: &str,
         table_name: &str,
         column_name: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        self.create_index_full(
+            index_name,
+            table_name,
+            vec![column_name.to_string()],
+            vec![false],
+            IndexKind::BTree,
+            false,
+            if_not_exists,
+        )
+    }
+
+    pub fn create_index_full(
+        &mut self,
+        index_name: &str,
+        table_name: &str,
+        columns: Vec<String>,
+        desc: Vec<bool>,
+        kind: IndexKind,
+        unique: bool,
         if_not_exists: bool,
     ) -> Result<()> {
         self.require_writable()?;
@@ -794,12 +1667,15 @@ impl Database {
                 index_name
             )));
         }
-        self.build_index_in_memory(index_name, table_name, column_name)?;
+        self.build_index_in_memory(index_name, table_name, &columns, &desc, kind, unique)?;
         let last = self.catalog.indexes.last().unwrap().clone();
-        self.record_wal_op(WalOp::CreateIndex {
+        self.record_wal_op(WalOp::CreateIndexV5 {
             name: last.name,
             table_name: last.table_name,
-            column_name: last.column_name,
+            columns: last.columns,
+            desc: last.desc,
+            kind: last.kind,
+            unique: last.unique,
         })?;
         Ok(())
     }
@@ -826,20 +1702,27 @@ impl Database {
     fn update_indexes_for_new_page(&mut self, schema: &TableSchema, page_id: u64, rows: &[Row]) {
         for idx in &mut self.catalog.indexes {
             if idx.table_name.eq_ignore_ascii_case(&schema.name) {
-                if let Some(c_idx) = schema.col_index(&idx.column_name) {
-                    let vals: Vec<Value> = rows.iter().map(|r| r.values[c_idx].clone()).collect();
-                    idx.index_page_values(page_id, &vals);
+                let col_idxs: Option<Vec<usize>> = idx
+                    .columns
+                    .iter()
+                    .map(|cn| schema.col_index(cn))
+                    .collect();
+                if let Some(cis) = col_idxs {
+                    let tuples: Vec<Vec<Value>> = rows
+                        .iter()
+                        .map(|r| cis.iter().map(|&ci| r.values[ci].clone()).collect())
+                        .collect();
+                    idx.index_page_tuples(page_id, tuples);
                 }
             }
         }
     }
 
-    /// Demand-paged index lookup: binary-searches the sparse block directory, reads ONLY the
-    /// matching leaf block(s) via LRU `index_cache`, plus checks any unflushed `pending_entries`.
-    fn lookup_paged_index(
+    /// Demand-paged hash index lookup.
+    fn lookup_hash_index(
         &mut self,
         ix_idx: usize,
-        vals: &[Value],
+        key_tuples: &[Vec<Value>],
     ) -> Result<(HashMap<u64, Vec<u32>>, usize)> {
         let mut by_page: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut blocks_read = 0usize;
@@ -848,16 +1731,14 @@ impl Database {
         let pending = self.catalog.indexes[ix_idx].pending_entries.clone();
         let removed = self.catalog.indexes[ix_idx].removed_pages.clone();
 
-        for v in vals {
-            let target = match hash_value(v) {
+        for tuple in key_tuples {
+            let target = match hash_key_tuple(tuple) {
                 Some(h) => h,
                 None => continue,
             };
-            // 1. Check pending unflushed entries
             if !pending.is_empty() {
                 IndexEntry::search_sorted_slice(&pending, target, &removed, &mut by_page);
             }
-            // 2. Binary-search sparse directory -> read ONLY matching on-disk block(s)!
             let cand_blocks = self.catalog.indexes[ix_idx].candidate_blocks(target);
             for b_i in cand_blocks {
                 let bmeta = &blocks_meta[b_i];
@@ -878,6 +1759,152 @@ impl Database {
         Ok((by_page, blocks_read))
     }
 
+    /// Demand-paged B-tree index lookup (supports composite prefixes + range scans!).
+    fn lookup_btree_index(
+        &mut self,
+        ix_idx: usize,
+        specs: &[BTreeScanSpec],
+    ) -> Result<(HashMap<u64, Vec<u32>>, usize)> {
+        let mut by_page: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut blocks_read = 0usize;
+
+        let blocks_meta = self.catalog.indexes[ix_idx].btree_blocks.clone();
+        let pending = self.catalog.indexes[ix_idx].pending_btree.clone();
+        let removed = self.catalog.indexes[ix_idx].removed_pages.clone();
+        let desc = self.catalog.indexes[ix_idx].desc.clone();
+
+        for spec in specs {
+            if !pending.is_empty() {
+                IndexEntry::search_btree_slice(&pending, spec, &desc, &removed, &mut by_page);
+            }
+            let cand_blocks = self.catalog.indexes[ix_idx].candidate_btree_blocks(spec);
+            for b_i in cand_blocks {
+                let bmeta = &blocks_meta[b_i];
+                if let Some(cached) = self.index_cache.get_btree(bmeta.offset) {
+                    IndexEntry::search_btree_slice(cached, spec, &desc, &removed, &mut by_page);
+                } else {
+                    blocks_read += 1;
+                    let decoded = self.storage.read_btree_index_block(bmeta)?;
+                    IndexEntry::search_btree_slice(&decoded, spec, &desc, &removed, &mut by_page);
+                    self.index_cache.insert_btree(bmeta.offset, decoded);
+                }
+            }
+        }
+        for slots in by_page.values_mut() {
+            slots.sort_unstable();
+            slots.dedup();
+        }
+        Ok((by_page, blocks_read))
+    }
+
+    /// Selects the best matching index (composite prefix equality + optional range bound)
+    /// for a table given extracted column predicates.
+    fn match_index_plan(
+        &self,
+        table_name: &str,
+        preds: &HashMap<String, ColumnPredicates>,
+    ) -> Option<(usize, IndexPlan)> {
+        let mut best: Option<(usize, usize, IndexPlan)> = None; // (score, ix_idx, plan)
+
+        for (ix_idx, ix) in self.catalog.indexes.iter().enumerate() {
+            if !ix.table_name.eq_ignore_ascii_case(table_name) || ix.columns.is_empty() {
+                continue;
+            }
+            match ix.kind {
+                IndexKind::Hash => {
+                    // Hash index requires equality on ALL indexed columns
+                    let mut all_eqs: Vec<Vec<Value>> = Vec::with_capacity(ix.columns.len());
+                    let mut ok = true;
+                    for col in &ix.columns {
+                        if let Some(cp) = preds.get(&col.to_ascii_lowercase()) {
+                            if let Some(ref eqs) = cp.eq_values {
+                                all_eqs.push(eqs.clone());
+                                continue;
+                            }
+                        }
+                        ok = false;
+                        break;
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    // Build cartesian product of equality tuples (bounded to avoid blowup)
+                    let mut tuples: Vec<Vec<Value>> = vec![Vec::new()];
+                    for vals in &all_eqs {
+                        let mut next = Vec::new();
+                        for pref in &tuples {
+                            for v in vals {
+                                let mut t = pref.clone();
+                                t.push(v.clone());
+                                next.push(t);
+                                if next.len() > 256 {
+                                    break;
+                                }
+                            }
+                        }
+                        tuples = next;
+                    }
+                    let score = ix.columns.len() * 10 + 1;
+                    if best.as_ref().map(|b| score > b.0).unwrap_or(true) {
+                        best = Some((score, ix_idx, IndexPlan::Hash(tuples)));
+                    }
+                }
+                IndexKind::BTree => {
+                    // Match leftmost prefix equality columns, optionally followed by a range column!
+                    let mut eq_prefixes: Vec<Vec<Value>> = vec![Vec::new()];
+                    let mut matched_eq_cols = 0usize;
+                    let mut trailing_range: Option<(RangeBound, RangeBound)> = None;
+
+                    for col in &ix.columns {
+                        if let Some(cp) = preds.get(&col.to_ascii_lowercase()) {
+                            if let Some(ref eqs) = cp.eq_values {
+                                let mut next = Vec::new();
+                                for pref in &eq_prefixes {
+                                    for v in eqs {
+                                        let mut t = pref.clone();
+                                        t.push(v.clone());
+                                        next.push(t);
+                                        if next.len() > 256 {
+                                            break;
+                                        }
+                                    }
+                                }
+                                eq_prefixes = next;
+                                matched_eq_cols += 1;
+                                continue;
+                            } else if cp.has_range() {
+                                trailing_range = Some((cp.range_lo.clone(), cp.range_hi.clone()));
+                                break;
+                            }
+                        }
+                        break;
+                    }
+
+                    if matched_eq_cols == 0 && trailing_range.is_none() {
+                        continue;
+                    }
+                    let (rlo, rhi) = trailing_range
+                        .unwrap_or((RangeBound::Unbounded, RangeBound::Unbounded));
+                    let has_range = !matches!(rlo, RangeBound::Unbounded)
+                        || !matches!(rhi, RangeBound::Unbounded);
+                    let specs: Vec<BTreeScanSpec> = eq_prefixes
+                        .into_iter()
+                        .map(|prefix_eq| BTreeScanSpec {
+                            prefix_eq,
+                            range_lo: rlo.clone(),
+                            range_hi: rhi.clone(),
+                        })
+                        .collect();
+                    let score = matched_eq_cols * 10 + if has_range { 5 } else { 0 };
+                    if best.as_ref().map(|b| score > b.0).unwrap_or(true) {
+                        best = Some((score, ix_idx, IndexPlan::BTree(specs)));
+                    }
+                }
+            }
+        }
+        best.map(|(_, ix_idx, plan)| (ix_idx, plan))
+    }
+
     /// Flushes all dirty secondary indexes into fresh compressed sorted on-disk leaf blocks.
     fn flush_dirty_indexes(&mut self) -> Result<()> {
         let profile = self.options.compression;
@@ -886,40 +1913,598 @@ impl Database {
             if !self.catalog.indexes[i].is_dirty() {
                 continue;
             }
-            let old_blocks = std::mem::take(&mut self.catalog.indexes[i].blocks);
-            let pending = std::mem::take(&mut self.catalog.indexes[i].pending_entries);
-            let removed = std::mem::take(&mut self.catalog.indexes[i].removed_pages);
+            let kind = self.catalog.indexes[i].kind;
+            match kind {
+                IndexKind::Hash => {
+                    let old_blocks = std::mem::take(&mut self.catalog.indexes[i].blocks);
+                    let pending = std::mem::take(&mut self.catalog.indexes[i].pending_entries);
+                    let removed = std::mem::take(&mut self.catalog.indexes[i].removed_pages);
 
-            let mut all_entries = Vec::new();
-            for bmeta in &old_blocks {
-                let decoded = self.storage.read_index_block(bmeta)?;
-                for e in decoded {
-                    if !removed.contains(&e.1) {
-                        all_entries.push(e);
+                    let mut all_entries = Vec::new();
+                    for bmeta in &old_blocks {
+                        let decoded = self.storage.read_index_block(bmeta)?;
+                        for e in decoded {
+                            if !removed.contains(&e.1) {
+                                all_entries.push(e);
+                            }
+                        }
                     }
-                }
-            }
-            for e in pending {
-                if !removed.contains(&e.1) {
-                    all_entries.push(e);
-                }
-            }
-            all_entries.sort_unstable();
-            all_entries.dedup();
+                    for e in pending {
+                        if !removed.contains(&e.1) {
+                            all_entries.push(e);
+                        }
+                    }
+                    all_entries.sort_unstable();
+                    all_entries.dedup();
 
-            let mut new_blocks = Vec::new();
-            for chunk in all_entries.chunks(INDEX_BLOCK_ENTRIES) {
-                let bmeta = self.storage.write_index_block(chunk, profile)?;
-                new_blocks.push(bmeta);
+                    let mut new_blocks = Vec::new();
+                    for chunk in all_entries.chunks(INDEX_BLOCK_ENTRIES) {
+                        let bmeta = self.storage.write_index_block(chunk, profile)?;
+                        new_blocks.push(bmeta);
+                    }
+                    self.catalog.indexes[i].blocks = new_blocks;
+                }
+                IndexKind::BTree => {
+                    let old_blocks = std::mem::take(&mut self.catalog.indexes[i].btree_blocks);
+                    let pending = std::mem::take(&mut self.catalog.indexes[i].pending_btree);
+                    let removed = std::mem::take(&mut self.catalog.indexes[i].removed_pages);
+                    let desc = self.catalog.indexes[i].desc.clone();
+                    let key_cols = self.catalog.indexes[i].columns.len();
+
+                    let mut all_entries = Vec::new();
+                    for bmeta in &old_blocks {
+                        let decoded = self.storage.read_btree_index_block(bmeta)?;
+                        for e in decoded {
+                            if !removed.contains(&e.1) {
+                                all_entries.push(e);
+                            }
+                        }
+                    }
+                    for e in pending {
+                        if !removed.contains(&e.1) {
+                            all_entries.push(e);
+                        }
+                    }
+                    all_entries.sort_by(|a, b| {
+                        cmp_key_tuple(&a.0, &b.0, &desc)
+                            .then_with(|| a.1.cmp(&b.1))
+                            .then_with(|| a.2.cmp(&b.2))
+                    });
+
+                    let mut new_blocks = Vec::new();
+                    for chunk in all_entries.chunks(INDEX_BLOCK_ENTRIES) {
+                        let bmeta =
+                            self.storage
+                                .write_btree_index_block(chunk, key_cols, profile)?;
+                        new_blocks.push(bmeta);
+                    }
+                    self.catalog.indexes[i].btree_blocks = new_blocks;
+                }
             }
-            self.catalog.indexes[i].blocks = new_blocks;
         }
         Ok(())
     }
 
     // ========================================================================
-    // Constraint checking (UNIQUE / PRIMARY KEY)
+    // Constraint checking: CHECK, UNIQUE / PRIMARY KEY, FOREIGN KEY
     // ========================================================================
+
+    fn check_row_constraints(&self, schema: &TableSchema, rows: &[Row]) -> Result<()> {
+        if schema.check_constraints.is_empty() || rows.is_empty() {
+            return Ok(());
+        }
+        let parsed: Vec<(&CheckConstraint, Expr)> = schema
+            .check_constraints
+            .iter()
+            .map(|c| parse_expr_str(&c.expr_sql).map(|e| (c, e)))
+            .collect::<Result<Vec<_>>>()?;
+
+        for row in rows {
+            for (chk, expr) in &parsed {
+                // Per SQL standard: CHECK fails ONLY when expression evaluates to FALSE (Some(false)).
+                // TRUE (Some(true)) and UNKNOWN/NULL (None) both pass.
+                if eval_bool(expr, schema, Some(row))? == Some(false) {
+                    let label = chk
+                        .name
+                        .as_deref()
+                        .unwrap_or(&chk.expr_sql);
+                    return Err(Error::InvalidData(format!(
+                        "CHECK constraint '{}' failed on table '{}'",
+                        label, schema.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn key_exists_in_table(
+        &mut self,
+        table_name: &str,
+        col_names: &[String],
+        target_vals: &[Value],
+        extra_batch: Option<&[Row]>,
+    ) -> Result<bool> {
+        let t_idx = self
+            .find_table_idx(table_name)
+            .ok_or_else(|| Error::Schema(format!("No such table: '{}'", table_name)))?;
+        let schema = self.catalog.tables[t_idx].schema.clone();
+        let col_idxs: Vec<usize> = col_names
+            .iter()
+            .map(|c| {
+                schema.col_index(c).ok_or_else(|| {
+                    Error::Schema(format!("Unknown column '{}.{}'", schema.name, c))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Check self-referential incoming batch first
+        if let Some(batch) = extra_batch {
+            for r in batch {
+                if col_idxs
+                    .iter()
+                    .zip(target_vals)
+                    .all(|(&ci, tv)| r.values[ci].sql_cmp(tv).is_eq())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Check hot buffer
+        let key = schema.name.to_ascii_lowercase();
+        if let Some(hot) = self.hot_buffers.get(&key) {
+            for r in hot {
+                if col_idxs
+                    .iter()
+                    .zip(target_vals)
+                    .all(|(&ci, tv)| r.values[ci].sql_cmp(tv).is_eq())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Check persisted pages (with zone-map / Bloom pruning)
+        let pages = self.catalog.tables[t_idx].pages.clone();
+        let mut needed = vec![false; schema.columns.len()];
+        for &ci in &col_idxs {
+            needed[ci] = true;
+        }
+        let pk_col = schema.integer_pk_col();
+
+        for p in &pages {
+            if p.live_rows() == 0 {
+                continue;
+            }
+            let mut pruned = false;
+            for (&ci, tv) in col_idxs.iter().zip(target_vals) {
+                if Some(ci) == pk_col {
+                    if let Value::Integer(iv) = tv {
+                        if *iv < p.min_rowid || *iv > p.max_rowid {
+                            pruned = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(zm) = p.zone_maps.get(ci) {
+                    if let (Some(lo), Some(hi)) = (&zm.min_val, &zm.max_val) {
+                        if tv.sql_cmp(lo).is_lt() || tv.sql_cmp(hi).is_gt() {
+                            pruned = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(Some(bf)) = p.blooms.get(ci) {
+                    if !bf.might_contain(tv) {
+                        pruned = true;
+                        break;
+                    }
+                }
+            }
+            if pruned {
+                continue;
+            }
+            let rows = self.storage.read_pax_page(&schema, p, Some(&needed))?;
+            for (slot, r) in rows.iter().enumerate() {
+                if p.is_deleted(slot as u32) {
+                    continue;
+                }
+                if col_idxs
+                    .iter()
+                    .zip(target_vals)
+                    .all(|(&ci, tv)| r.values[ci].sql_cmp(tv).is_eq())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn check_foreign_keys_on_write(&mut self, schema: &TableSchema, rows: &[Row]) -> Result<()> {
+        if !self.foreign_keys_enabled || schema.foreign_keys.is_empty() || rows.is_empty() {
+            return Ok(());
+        }
+        for fk in &schema.foreign_keys {
+            let child_idxs: Vec<usize> = fk
+                .columns
+                .iter()
+                .map(|c| {
+                    schema.col_index(c).ok_or_else(|| {
+                        Error::Schema(format!("Unknown FK column '{}.{}'", schema.name, c))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let is_self_ref = fk.ref_table.eq_ignore_ascii_case(&schema.name);
+            let mut checked_keys: HashMap<u64, Vec<Vec<Value>>> = HashMap::new();
+
+            for row in rows {
+                let key_vals: Vec<Value> = child_idxs
+                    .iter()
+                    .map(|&ci| row.values[ci].clone())
+                    .collect();
+                // SQL MATCH SIMPLE: if any FK column is NULL, constraint passes
+                if key_vals.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                if let Some(h) = hash_key_tuple(&key_vals) {
+                    let bucket = checked_keys.entry(h).or_default();
+                    if bucket
+                        .iter()
+                        .any(|prev| prev.iter().zip(&key_vals).all(|(a, b)| a.sql_cmp(b).is_eq()))
+                    {
+                        continue;
+                    }
+                    let extra = if is_self_ref { Some(rows) } else { None };
+                    if !self.key_exists_in_table(&fk.ref_table, &fk.ref_columns, &key_vals, extra)?
+                    {
+                        return Err(Error::InvalidData(format!(
+                            "FOREIGN KEY constraint failed on '{}' ({}) referencing '{}' ({}): value {:?} not found",
+                            schema.name,
+                            fk.columns.join(", "),
+                            fk.ref_table,
+                            fk.ref_columns.join(", "),
+                            key_vals
+                        )));
+                    }
+                    bucket.push(key_vals);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn find_referencing_fks(&self, parent_table: &str) -> Vec<(String, ForeignKeyDef)> {
+        let mut out = Vec::new();
+        for t in &self.catalog.tables {
+            for fk in &t.schema.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(parent_table) {
+                    out.push((t.schema.name.clone(), fk.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn verify_no_referencing_children(&mut self, parent_table: &str, deleted_rows: &[Row]) -> Result<()> {
+        if deleted_rows.is_empty() {
+            return Ok(());
+        }
+        let parent_schema = match self.table_schema(parent_table) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let refs = self.find_referencing_fks(parent_table);
+        for (child_table, fk) in refs {
+            let p_idxs: Vec<usize> = fk
+                .ref_columns
+                .iter()
+                .filter_map(|c| parent_schema.col_index(c))
+                .collect();
+            let deleted_ids: HashSet<i64> = deleted_rows.iter().map(|r| r.rowid).collect();
+            let child_rows = self.scan_all(&child_table)?;
+            let child_schema = self.table_schema(&child_table).unwrap().clone();
+            let c_idxs: Vec<usize> = fk
+                .columns
+                .iter()
+                .filter_map(|c| child_schema.col_index(c))
+                .collect();
+
+            for prow in deleted_rows {
+                let pkey: Vec<&Value> = p_idxs.iter().map(|&i| &prow.values[i]).collect();
+                if pkey.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                for crow in &child_rows {
+                    if child_table.eq_ignore_ascii_case(parent_table)
+                        && deleted_ids.contains(&crow.rowid)
+                    {
+                        continue;
+                    }
+                    if c_idxs
+                        .iter()
+                        .zip(&pkey)
+                        .all(|(&ci, pv)| crow.values[ci].sql_cmp(pv).is_eq())
+                    {
+                        return Err(Error::InvalidData(format!(
+                            "FOREIGN KEY constraint failed: cannot DELETE from '{}' because '{}' references {:?}",
+                            parent_table, child_table, pkey
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch_rows_by_ids(&mut self, table: &str, ids: &HashSet<i64>) -> Result<Vec<Row>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all = self.scan_all(table)?;
+        Ok(all.into_iter().filter(|r| ids.contains(&r.rowid)).collect())
+    }
+
+    fn enforce_parent_delete_cascades(
+        &mut self,
+        parent_table: &str,
+        deleted_rows: &[Row],
+        visited: &mut HashSet<(String, i64)>,
+    ) -> Result<()> {
+        if !self.foreign_keys_enabled || deleted_rows.is_empty() {
+            return Ok(());
+        }
+        let parent_schema = match self.table_schema(parent_table) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let refs = self.find_referencing_fks(parent_table);
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        for (child_table, fk) in refs {
+            let p_idxs: Vec<usize> = fk
+                .ref_columns
+                .iter()
+                .filter_map(|c| parent_schema.col_index(c))
+                .collect();
+            let child_schema = match self.table_schema(&child_table) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let c_idxs: Vec<usize> = fk
+                .columns
+                .iter()
+                .filter_map(|c| child_schema.col_index(c))
+                .collect();
+
+            let mut deleted_keys: Vec<Vec<Value>> = Vec::new();
+            for prow in deleted_rows {
+                let pkey: Vec<Value> = p_idxs.iter().map(|&i| prow.values[i].clone()).collect();
+                if !pkey.iter().any(|v| v.is_null()) {
+                    deleted_keys.push(pkey);
+                }
+            }
+            if deleted_keys.is_empty() {
+                continue;
+            }
+
+            let child_rows = self.scan_all(&child_table)?;
+            let mut matched_children: Vec<Row> = Vec::new();
+            for crow in child_rows {
+                if visited.contains(&(child_table.to_ascii_lowercase(), crow.rowid)) {
+                    continue;
+                }
+                let matches_any = deleted_keys.iter().any(|pk| {
+                    c_idxs
+                        .iter()
+                        .zip(pk)
+                        .all(|(&ci, pv)| crow.values[ci].sql_cmp(pv).is_eq())
+                });
+                if matches_any {
+                    matched_children.push(crow);
+                }
+            }
+            if matched_children.is_empty() {
+                continue;
+            }
+
+            match fk.on_delete {
+                FkAction::NoAction | FkAction::Restrict => {
+                    return Err(Error::InvalidData(format!(
+                        "FOREIGN KEY constraint failed: cannot DELETE from '{}' while rows in '{}' reference it",
+                        parent_table, child_table
+                    )));
+                }
+                FkAction::Cascade => {
+                    for r in &matched_children {
+                        visited.insert((child_table.to_ascii_lowercase(), r.rowid));
+                    }
+                    let rowids: Vec<i64> = matched_children.iter().map(|r| r.rowid).collect();
+                    let set: HashSet<i64> = rowids.iter().copied().collect();
+                    self.mark_rowids_deleted_in_memory(&child_table, &set)?;
+                    self.record_wal_op(WalOp::DeleteRowIds {
+                        table_name: child_table.clone(),
+                        rowids,
+                    })?;
+                    self.enforce_parent_delete_cascades(&child_table, &matched_children, visited)?;
+                }
+                FkAction::SetNull | FkAction::SetDefault => {
+                    let is_null = fk.on_delete == FkAction::SetNull;
+                    let mut updated = Vec::with_capacity(matched_children.len());
+                    let mut old_ids = HashSet::with_capacity(matched_children.len());
+                    for mut crow in matched_children {
+                        old_ids.insert(crow.rowid);
+                        for &ci in &c_idxs {
+                            let col_def = &child_schema.columns[ci];
+                            let new_v = if is_null {
+                                Value::Null
+                            } else {
+                                col_def.default_value.clone().unwrap_or(Value::Null)
+                            };
+                            if (col_def.not_null || col_def.primary_key) && new_v.is_null() {
+                                return Err(Error::InvalidData(format!(
+                                    "NOT NULL constraint failed during FOREIGN KEY action on '{}.{}'",
+                                    child_schema.name, col_def.name
+                                )));
+                            }
+                            crow.values[ci] = new_v;
+                        }
+                        updated.push(crow);
+                    }
+                    self.check_row_constraints(&child_schema, &updated)?;
+                    self.check_unique_constraints(
+                        &child_schema.name,
+                        &child_schema,
+                        &updated,
+                        Some(&old_ids),
+                    )?;
+                    self.mark_rowids_deleted_in_memory(&child_schema.name, &old_ids)?;
+                    let ckey = child_schema.name.to_ascii_lowercase();
+                    self.hot_buffers
+                        .entry(ckey)
+                        .or_default()
+                        .extend(updated.clone());
+                    self.record_wal_op(WalOp::UpdateRows {
+                        table_name: child_schema.name,
+                        rows: updated,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_parent_update_cascades(
+        &mut self,
+        parent_table: &str,
+        changed_pairs: &[(Row, Row)],
+    ) -> Result<()> {
+        if !self.foreign_keys_enabled || changed_pairs.is_empty() {
+            return Ok(());
+        }
+        let parent_schema = match self.table_schema(parent_table) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let refs = self.find_referencing_fks(parent_table);
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        for (child_table, fk) in refs {
+            let p_idxs: Vec<usize> = fk
+                .ref_columns
+                .iter()
+                .filter_map(|c| parent_schema.col_index(c))
+                .collect();
+            let child_schema = match self.table_schema(&child_table) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let c_idxs: Vec<usize> = fk
+                .columns
+                .iter()
+                .filter_map(|c| child_schema.col_index(c))
+                .collect();
+
+            let mut key_changes: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+            for (old_r, new_r) in changed_pairs {
+                let old_k: Vec<Value> = p_idxs.iter().map(|&i| old_r.values[i].clone()).collect();
+                let new_k: Vec<Value> = p_idxs.iter().map(|&i| new_r.values[i].clone()).collect();
+                if old_k.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                if old_k
+                    .iter()
+                    .zip(&new_k)
+                    .any(|(a, b)| !a.sql_cmp(b).is_eq())
+                {
+                    key_changes.push((old_k, new_k));
+                }
+            }
+            if key_changes.is_empty() {
+                continue;
+            }
+
+            let child_rows = self.scan_all(&child_table)?;
+            let mut matched: Vec<(Row, Vec<Value>)> = Vec::new();
+            for crow in child_rows {
+                for (ok, nk) in &key_changes {
+                    if c_idxs
+                        .iter()
+                        .zip(ok)
+                        .all(|(&ci, pv)| crow.values[ci].sql_cmp(pv).is_eq())
+                    {
+                        matched.push((crow, nk.clone()));
+                        break;
+                    }
+                }
+            }
+            if matched.is_empty() {
+                continue;
+            }
+
+            match fk.on_update {
+                FkAction::NoAction | FkAction::Restrict => {
+                    return Err(Error::InvalidData(format!(
+                        "FOREIGN KEY constraint failed: cannot UPDATE referenced key on '{}' while '{}' references it",
+                        parent_table, child_table
+                    )));
+                }
+                FkAction::Cascade | FkAction::SetNull | FkAction::SetDefault => {
+                    let mut updated = Vec::with_capacity(matched.len());
+                    let mut old_ids = HashSet::with_capacity(matched.len());
+                    let mut child_pairs = Vec::with_capacity(matched.len());
+                    for (mut crow, new_k) in matched {
+                        let orig = crow.clone();
+                        old_ids.insert(crow.rowid);
+                        for (pos, &ci) in c_idxs.iter().enumerate() {
+                            let col_def = &child_schema.columns[ci];
+                            let nv = match fk.on_update {
+                                FkAction::Cascade => new_k[pos].coerce_for_column(col_def.col_type)?,
+                                FkAction::SetNull => Value::Null,
+                                FkAction::SetDefault => {
+                                    col_def.default_value.clone().unwrap_or(Value::Null)
+                                }
+                                _ => unreachable!(),
+                            };
+                            if (col_def.not_null || col_def.primary_key) && nv.is_null() {
+                                return Err(Error::InvalidData(format!(
+                                    "NOT NULL constraint failed during ON UPDATE action on '{}.{}'",
+                                    child_schema.name, col_def.name
+                                )));
+                            }
+                            crow.values[ci] = nv;
+                        }
+                        child_pairs.push((orig, crow.clone()));
+                        updated.push(crow);
+                    }
+                    self.check_row_constraints(&child_schema, &updated)?;
+                    self.check_unique_constraints(
+                        &child_schema.name,
+                        &child_schema,
+                        &updated,
+                        Some(&old_ids),
+                    )?;
+                    self.mark_rowids_deleted_in_memory(&child_schema.name, &old_ids)?;
+                    let ckey = child_schema.name.to_ascii_lowercase();
+                    self.hot_buffers
+                        .entry(ckey)
+                        .or_default()
+                        .extend(updated.clone());
+                    self.record_wal_op(WalOp::UpdateRows {
+                        table_name: child_schema.name.clone(),
+                        rows: updated,
+                    })?;
+                    self.enforce_parent_update_cascades(&child_schema.name, &child_pairs)?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn check_unique_constraints(
         &mut self,
@@ -928,6 +2513,9 @@ impl Database {
         new_rows: &[Row],
         ignore_rowids: Option<&HashSet<i64>>,
     ) -> Result<()> {
+        if new_rows.is_empty() {
+            return Ok(());
+        }
         let unique_cols: Vec<usize> = schema
             .columns
             .iter()
@@ -935,9 +2523,6 @@ impl Database {
             .filter(|(_, c)| c.unique || c.primary_key)
             .map(|(i, _)| i)
             .collect();
-        if unique_cols.is_empty() || new_rows.is_empty() {
-            return Ok(());
-        }
 
         let pk_col = schema.integer_pk_col();
         let t_idx = self.find_table_idx(table).unwrap();
@@ -945,7 +2530,6 @@ impl Database {
 
         for &c_idx in &unique_cols {
             let col_name = &schema.columns[c_idx].name;
-            // 1. Check duplicates within the incoming batch itself in O(B)
             let mut batch_hashes: HashMap<u64, Vec<&Value>> = HashMap::with_capacity(new_rows.len());
             let mut min_int_val = i64::MAX;
             let mut max_int_val = i64::MIN;
@@ -980,8 +2564,6 @@ impl Database {
                 continue;
             }
 
-            // O(1) fast path: sequential / auto-increment INTEGER PRIMARY KEY above `next_rowid`
-            // is guaranteed disjoint from all existing rows!
             if Some(c_idx) == pk_col
                 && ignore_rowids.is_none()
                 && all_int
@@ -990,7 +2572,6 @@ impl Database {
                 continue;
             }
 
-            // 2. Check against existing rows in O(1) hash lookup per row (with zone-map / Bloom pruning!)
             let key = schema.name.to_ascii_lowercase();
             if let Some(hot) = self.hot_buffers.get(&key) {
                 for ex in hot {
@@ -1020,7 +2601,6 @@ impl Database {
                 if p.live_rows() == 0 {
                     continue;
                 }
-                // Zone-map fast skip for integer PK / monotonic columns
                 if all_int {
                     if Some(c_idx) == pk_col {
                         if max_int_val < p.min_rowid || min_int_val > p.max_rowid {
@@ -1036,7 +2616,6 @@ impl Database {
                         }
                     }
                 }
-                // Bloom filter skip for small batches
                 if batch_hashes.len() <= 32 {
                     if let Some(Some(bf)) = p.blooms.get(c_idx) {
                         let any_hit = batch_hashes
@@ -1072,11 +2651,109 @@ impl Database {
                 }
             }
         }
+
+        // Also enforce CREATE UNIQUE INDEX (single-column or composite multi-column!)
+        let unique_indexes: Vec<(String, Vec<usize>)> = self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|ix| ix.unique && ix.table_name.eq_ignore_ascii_case(&schema.name))
+            .filter_map(|ix| {
+                let cis: Option<Vec<usize>> = ix
+                    .columns
+                    .iter()
+                    .map(|c| schema.col_index(c))
+                    .collect();
+                cis.map(|v| (ix.name.clone(), v))
+            })
+            .collect();
+
+        for (ix_name, cis) in unique_indexes {
+            let mut batch_map: HashMap<u64, Vec<Vec<Value>>> = HashMap::new();
+            for r in new_rows {
+                let tup: Vec<Value> = cis.iter().map(|&ci| r.values[ci].clone()).collect();
+                if let Some(h) = hash_key_tuple(&tup) {
+                    let bucket = batch_map.entry(h).or_default();
+                    if bucket
+                        .iter()
+                        .any(|ex| ex.iter().zip(&tup).all(|(a, b)| a.sql_cmp(b).is_eq()))
+                    {
+                        return Err(Error::InvalidData(format!(
+                            "UNIQUE index '{}' failed on '{}': duplicate key {:?}",
+                            ix_name, schema.name, tup
+                        )));
+                    }
+                    bucket.push(tup);
+                }
+            }
+            if batch_map.is_empty() {
+                continue;
+            }
+            let key = schema.name.to_ascii_lowercase();
+            if let Some(hot) = self.hot_buffers.get(&key) {
+                for ex in hot {
+                    if let Some(ign) = ignore_rowids {
+                        if ign.contains(&ex.rowid) {
+                            continue;
+                        }
+                    }
+                    let tup: Vec<Value> = cis.iter().map(|&ci| ex.values[ci].clone()).collect();
+                    if let Some(h) = hash_key_tuple(&tup) {
+                        if let Some(bucket) = batch_map.get(&h) {
+                            if bucket
+                                .iter()
+                                .any(|nv| nv.iter().zip(&tup).all(|(a, b)| a.sql_cmp(b).is_eq()))
+                            {
+                                return Err(Error::InvalidData(format!(
+                                    "UNIQUE index '{}' failed on '{}': key {:?} already exists",
+                                    ix_name, schema.name, tup
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            let pages = self.catalog.tables[t_idx].pages.clone();
+            let mut needed = vec![false; schema.columns.len()];
+            for &ci in &cis {
+                needed[ci] = true;
+            }
+            for p in &pages {
+                if p.live_rows() == 0 {
+                    continue;
+                }
+                let page_rows = self.storage.read_pax_page(&schema, p, Some(&needed))?;
+                for (slot, ex) in page_rows.iter().enumerate() {
+                    if p.is_deleted(slot as u32) {
+                        continue;
+                    }
+                    if let Some(ign) = ignore_rowids {
+                        if ign.contains(&ex.rowid) {
+                            continue;
+                        }
+                    }
+                    let tup: Vec<Value> = cis.iter().map(|&ci| ex.values[ci].clone()).collect();
+                    if let Some(h) = hash_key_tuple(&tup) {
+                        if let Some(bucket) = batch_map.get(&h) {
+                            if bucket
+                                .iter()
+                                .any(|nv| nv.iter().zip(&tup).all(|(a, b)| a.sql_cmp(b).is_eq()))
+                            {
+                                return Err(Error::InvalidData(format!(
+                                    "UNIQUE index '{}' failed on '{}': key {:?} already exists",
+                                    ix_name, schema.name, tup
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     // ========================================================================
-    // DML: Insert, Bulk Insert, Scan, Vectorized Analytics, Update, Delete
+    // DML: Insert, Bulk Insert, Scan, Parallel Vectorized Analytics, Update, Delete
     // ========================================================================
 
     pub fn insert_row(&mut self, table: &str, values: Vec<Value>) -> Result<i64> {
@@ -1158,8 +2835,10 @@ impl Database {
             });
         }
 
-        // Enforce UNIQUE / PRIMARY KEY constraints!
+        // Enforce CHECK, UNIQUE/PK, and FOREIGN KEY constraints
+        self.check_row_constraints(&schema, &rows)?;
         self.check_unique_constraints(table, &schema, &rows, None)?;
+        self.check_foreign_keys_on_write(&schema, &rows)?;
 
         self.catalog.tables[idx].schema.next_rowid = next_rowid;
         let canonical = self.catalog.tables[idx].schema.name.clone();
@@ -1238,6 +2917,14 @@ impl Database {
             });
         }
 
+        if !schema.check_constraints.is_empty() {
+            self.check_row_constraints(&schema, &rows)?;
+        }
+        self.check_unique_constraints(&schema.name, &schema, &rows, None)?;
+        if self.foreign_keys_enabled && !schema.foreign_keys.is_empty() {
+            self.check_foreign_keys_on_write(&schema, &rows)?;
+        }
+
         let count = rows.len();
         self.catalog.tables[idx].schema.next_rowid = next_rowid;
         let key = schema.name.to_ascii_lowercase();
@@ -1250,6 +2937,7 @@ impl Database {
             self.options.page_rows * 16
         };
         let page_rows = self.options.page_rows;
+        let profile = self.options.compression;
         if buf.len() >= flush_thresh {
             let mut to_flush = std::mem::take(buf);
             if !schema.cluster_by.is_empty() {
@@ -1258,13 +2946,25 @@ impl Database {
             let full_len = (to_flush.len() / page_rows) * page_rows;
             let remainder = to_flush.split_off(full_len);
             *buf = remainder;
-            for chunk in to_flush.chunks(page_rows) {
-                let meta =
-                    self.storage
-                        .write_pax_page(&schema, chunk, self.options.compression)?;
-                let pid = meta.page_id;
-                self.catalog.tables[idx].pages.push(meta);
-                self.update_indexes_for_new_page(&schema, pid, chunk);
+
+            let chunks: Vec<&[Row]> = to_flush.chunks(page_rows).collect();
+            if chunks.len() >= 2 && self.pool.worker_count() > 1 {
+                let encoded_pages: Vec<Result<_>> = self
+                    .pool
+                    .execute_indexed(&chunks, |_, chunk| encode_pax_page(&schema, chunk, profile));
+                for (chunk, enc_res) in chunks.into_iter().zip(encoded_pages) {
+                    let meta = self.storage.write_encoded_pax_page(enc_res?)?;
+                    let pid = meta.page_id;
+                    self.catalog.tables[idx].pages.push(meta);
+                    self.update_indexes_for_new_page(&schema, pid, chunk);
+                }
+            } else {
+                for chunk in chunks {
+                    let meta = self.storage.write_pax_page(&schema, chunk, profile)?;
+                    let pid = meta.page_id;
+                    self.catalog.tables[idx].pages.push(meta);
+                    self.update_indexes_for_new_page(&schema, pid, chunk);
+                }
             }
         }
         self.dirty = true;
@@ -1298,8 +2998,8 @@ impl Database {
         Ok(rows)
     }
 
-    /// Vectorized columnar streaming GROUP BY executor: decodes ONLY needed columns directly into
-    /// typed `ColumnBatch` arrays with zero row-transposition or `Vec<Value>` allocations!
+    /// Parallel vectorized columnar streaming GROUP BY executor (PostgreSQL-style Gather +
+    /// Partial HashAggregate across worker threads!).
     pub fn vectorized_group_by(
         &mut self,
         table: &str,
@@ -1320,9 +3020,9 @@ impl Database {
             total_pages: pages.len(),
             ..Default::default()
         };
-        let mut group_table = VectorGroupTable::new(group_col, agg_kinds.to_vec());
 
-        for page_meta in &pages {
+        let mut candidate_indices: Vec<usize> = Vec::with_capacity(pages.len());
+        for (p_i, page_meta) in pages.iter().enumerate() {
             if page_meta.live_rows() == 0 {
                 continue;
             }
@@ -1345,11 +3045,56 @@ impl Database {
                     continue;
                 }
             }
-            metrics.pages_scanned += 1;
-            let batch = self
-                .storage
-                .read_pax_batch(&schema, page_meta, needed_cols, false)?;
-            group_table.ingest_batch(&batch, &page_meta.deleted_slots, vec_filter);
+            candidate_indices.push(p_i);
+        }
+
+        metrics.pages_scanned = candidate_indices.len();
+        let mut group_table = VectorGroupTable::new(group_col, agg_kinds.to_vec());
+
+        // Parallel vectorized scan + partial aggregation across worker pool!
+        let num_workers = self.pool.worker_count();
+        if candidate_indices.len() >= 4 && num_workers > 1 {
+            let eff_workers = num_workers.min(candidate_indices.len());
+            metrics.parallel_workers = eff_workers;
+            let path = self.path.clone();
+            let pages_ref = &pages;
+            let cand_ref = &candidate_indices;
+            let schema_ref = &schema;
+
+            let partials: Vec<Result<VectorGroupTable>> =
+                self.pool.execute_shards(eff_workers, |shard_id, total_shards| {
+                    let mut local = VectorGroupTable::new(group_col, agg_kinds.to_vec());
+                    let chunk = (cand_ref.len() + total_shards - 1) / total_shards;
+                    let start = shard_id * chunk;
+                    if start >= cand_ref.len() {
+                        return Ok(local);
+                    }
+                    let end = (start + chunk).min(cand_ref.len());
+                    let mut f = File::open(&path)?;
+                    for &p_i in &cand_ref[start..end] {
+                        let page_meta = &pages_ref[p_i];
+                        let batch = read_pax_batch_from_file(
+                            &mut f,
+                            schema_ref,
+                            page_meta,
+                            needed_cols,
+                            false,
+                        )?;
+                        local.ingest_batch(&batch, &page_meta.deleted_slots, vec_filter);
+                    }
+                    Ok(local)
+                });
+            for part_res in partials {
+                group_table.merge_from(part_res?);
+            }
+        } else {
+            for &p_i in &candidate_indices {
+                let page_meta = &pages[p_i];
+                let batch = self
+                    .storage
+                    .read_pax_batch(&schema, page_meta, needed_cols, false)?;
+                group_table.ingest_batch(&batch, &page_meta.deleted_slots, vec_filter);
+            }
         }
 
         // Also ingest any unflushed hot-buffer rows
@@ -1375,17 +3120,13 @@ impl Database {
         Ok((group_table.into_groups(), metrics))
     }
 
-    /// Ultra-fast zero-clone indexed point lookup:
-    /// - Zero `PageMeta` / `BloomFilter` / `IndexBlockMeta` cloning!
-    /// - Demand-pages ONLY the matching SSTable index leaf block into `index_cache`!
-    /// - Reads & caches ONLY the filter column + projected output columns as typed `ColumnVector`s!
-    /// - Jumps directly in O(1) to `slot` without ever materializing `Vec<Row>`!
+    /// Ultra-fast zero-clone indexed point lookup (supports both Hash and B-Tree indexes!).
     pub fn fast_indexed_point_lookup(
         &mut self,
         table: &str,
         filter_col_idx: usize,
         target_val: &Value,
-        proj_cols: &[Option<usize>], // None = rowid, Some(c_idx) = user column
+        proj_cols: &[Option<usize>],
     ) -> Result<Option<(Vec<Vec<Value>>, ScanMetrics)>> {
         let t_idx = match self.find_table_idx(table) {
             Some(i) => i,
@@ -1396,86 +3137,73 @@ impl Database {
             .name
             .clone();
 
+        // Find any index where `col_name` is the sole column (Hash) or leading column (BTree)
         let ix_idx = match self.catalog.indexes.iter().position(|i| {
             i.table_name.eq_ignore_ascii_case(&table_name_matches)
-                && i.column_name.eq_ignore_ascii_case(&col_name)
+                && i.columns
+                    .first()
+                    .map(|c| c.eq_ignore_ascii_case(&col_name))
+                    .unwrap_or(false)
+                && (i.kind == IndexKind::BTree || i.columns.len() == 1)
         }) {
             Some(i) => i,
             None => return Ok(None),
         };
 
-        let target_hash = match hash_value(target_val) {
-            Some(h) => h,
-            None => {
-                return Ok(Some((
-                    Vec::new(),
-                    ScanMetrics {
-                        total_pages: self.catalog.tables[t_idx].pages.len(),
-                        pruned_by_index: self.catalog.tables[t_idx].pages.len(),
-                        index_used: Some(self.catalog.indexes[ix_idx].name.clone()),
-                        ..Default::default()
-                    },
-                )));
-            }
-        };
-
         let total_pages = self.catalog.tables[t_idx].pages.len();
         let index_name = self.catalog.indexes[ix_idx].name.clone();
+        let index_kind = self.catalog.indexes[ix_idx].kind;
+
+        if target_val.is_null() {
+            return Ok(Some((
+                Vec::new(),
+                ScanMetrics {
+                    total_pages,
+                    pruned_by_index: total_pages,
+                    index_used: Some(index_name),
+                    ..Default::default()
+                },
+            )));
+        }
+
         let mut metrics = ScanMetrics {
             total_pages,
             index_used: Some(index_name),
             ..Default::default()
         };
 
-        // 1. Zero-clone sparse directory binary search + demand-paged leaf block lookup
         let mut matched_locs: Vec<(u64, u32)> = Vec::new();
-        {
-            let ix = &self.catalog.indexes[ix_idx];
-            if !ix.pending_entries.is_empty() {
-                let start = ix.pending_entries.partition_point(|&(h, _, _)| h < target_hash);
-                let mut i = start;
-                while i < ix.pending_entries.len() && ix.pending_entries[i].0 == target_hash {
-                    let (_, pid, slot) = ix.pending_entries[i];
-                    if !ix.removed_pages.contains(&pid) {
+        let needs_hash_recheck = match index_kind {
+            IndexKind::Hash => {
+                let (by_page, bread) =
+                    self.lookup_hash_index(ix_idx, &[vec![target_val.clone()]])?;
+                metrics.index_blocks_read += bread;
+                for (pid, slots) in by_page {
+                    for slot in slots {
                         matched_locs.push((pid, slot));
                     }
-                    i += 1;
                 }
+                true
             }
-            let cand_blocks = ix.candidate_blocks(target_hash);
-            for b_i in cand_blocks {
-                let bmeta = &ix.blocks[b_i];
-                let off = bmeta.offset;
-                if let Some(cached) = self.index_cache.get(off) {
-                    let start = cached.partition_point(|&(h, _, _)| h < target_hash);
-                    let mut i = start;
-                    while i < cached.len() && cached[i].0 == target_hash {
-                        let (_, pid, slot) = cached[i];
-                        if !ix.removed_pages.contains(&pid) {
-                            matched_locs.push((pid, slot));
-                        }
-                        i += 1;
+            IndexKind::BTree => {
+                let spec = BTreeScanSpec {
+                    prefix_eq: vec![target_val.clone()],
+                    range_lo: RangeBound::Unbounded,
+                    range_hi: RangeBound::Unbounded,
+                };
+                let (by_page, bread) = self.lookup_btree_index(ix_idx, &[spec])?;
+                metrics.index_blocks_read += bread;
+                for (pid, slots) in by_page {
+                    for slot in slots {
+                        matched_locs.push((pid, slot));
                     }
-                } else {
-                    metrics.index_blocks_read += 1;
-                    let decoded = self.storage.read_index_block(bmeta)?;
-                    let start = decoded.partition_point(|&(h, _, _)| h < target_hash);
-                    let mut i = start;
-                    while i < decoded.len() && decoded[i].0 == target_hash {
-                        let (_, pid, slot) = decoded[i];
-                        if !ix.removed_pages.contains(&pid) {
-                            matched_locs.push((pid, slot));
-                        }
-                        i += 1;
-                    }
-                    self.index_cache.insert(off, decoded);
                 }
+                false // B-tree stores exact keys: zero hash-collision recheck needed!
             }
-        }
+        };
         matched_locs.sort_unstable();
         matched_locs.dedup();
 
-        // Count unique pages touched
         let mut unique_pids: Vec<u64> = matched_locs.iter().map(|&(p, _)| p).collect();
         unique_pids.dedup();
         metrics.pages_scanned = unique_pids.len();
@@ -1506,33 +3234,39 @@ impl Database {
                 continue;
             }
 
-            // Ensure filter column is in ColumnCache (reads ONLY that 1 column chunk on miss!)
-            let filter_hit = self.cache.get_col(pid, filter_ck).is_some();
-            if filter_hit {
-                metrics.cache_hits += 1;
-            } else {
-                let cv = self.storage.read_pax_column(
-                    &self.catalog.tables[t_idx].schema,
-                    &self.catalog.tables[t_idx].pages[p_pos],
-                    Some(filter_col_idx),
-                )?;
-                self.cache.insert_col(pid, filter_ck, cv);
+            if needs_hash_recheck {
+                let filter_hit = self.cache.get_col(pid, filter_ck).is_some();
+                if filter_hit {
+                    metrics.cache_hits += 1;
+                } else {
+                    let cv = self.storage.read_pax_column(
+                        &self.catalog.tables[t_idx].schema,
+                        &self.catalog.tables[t_idx].pages[p_pos],
+                        Some(filter_col_idx),
+                    )?;
+                    self.cache.insert_col(pid, filter_ck, cv);
+                }
+
+                let matched = self
+                    .cache
+                    .get_col(pid, filter_ck)
+                    .map(|cv| cv.eq_value_at(slot as usize, target_val))
+                    .unwrap_or(false);
+                if !matched {
+                    continue;
+                }
             }
 
-            let matched = self
-                .cache
-                .get_col(pid, filter_ck)
-                .map(|cv| cv.eq_value_at(slot as usize, target_val))
-                .unwrap_or(false);
-            if !matched {
-                continue;
-            }
-
-            // Ensure every projected column is loaded (reads ONLY those columns on miss!)
             let mut row_vals = Vec::with_capacity(proj_cols.len());
+            let mut counted_hit = false;
             for &pc in proj_cols {
                 let ck = col_key_for(pc);
-                if self.cache.get_col(pid, ck).is_none() {
+                if self.cache.get_col(pid, ck).is_some() {
+                    if !needs_hash_recheck && !counted_hit {
+                        metrics.cache_hits += 1;
+                        counted_hit = true;
+                    }
+                } else {
                     let cv = self.storage.read_pax_column(
                         &self.catalog.tables[t_idx].schema,
                         &self.catalog.tables[t_idx].pages[p_pos],
@@ -1550,7 +3284,6 @@ impl Database {
             out_rows.push(row_vals);
         }
 
-        // Also check hot buffer
         let key = table_name_matches.to_ascii_lowercase();
         if let Some(hot) = self.hot_buffers.get(&key) {
             for r in hot {
@@ -1601,39 +3334,19 @@ impl Database {
         let eff_alias = alias.unwrap_or(&schema.name);
         let eval_schema = EvalSchema::from_single(eff_alias, &schema);
 
-        // Step 1: Demand-paged Secondary Index lookup!
+        // Step 1: Composite & Range B-Tree / Hash Secondary Index lookup!
         let mut allowed_locs: Option<HashMap<u64, Vec<u32>>> = None;
         if let Some(expr) = where_clause {
-            let candidates = extract_index_candidates(expr);
-            for (col_name, vals) in candidates {
-                let ix_pos = self.catalog.indexes.iter().position(|i| {
-                    i.table_name.eq_ignore_ascii_case(&schema.name)
-                        && i.column_name.eq_ignore_ascii_case(&col_name)
-                });
-                if let Some(ix_idx) = ix_pos {
-                    let ix_name = self.catalog.indexes[ix_idx].name.clone();
-                    let (matched_locs, b_read) = self.lookup_paged_index(ix_idx, &vals)?;
-                    metrics.index_blocks_read += b_read;
-                    allowed_locs = Some(match allowed_locs {
-                        None => matched_locs,
-                        Some(prev) => {
-                            let mut inter = HashMap::new();
-                            for (pid, slots) in prev {
-                                if let Some(other_slots) = matched_locs.get(&pid) {
-                                    let common: Vec<u32> = slots
-                                        .into_iter()
-                                        .filter(|s| other_slots.binary_search(s).is_ok())
-                                        .collect();
-                                    if !common.is_empty() {
-                                        inter.insert(pid, common);
-                                    }
-                                }
-                            }
-                            inter
-                        }
-                    });
-                    metrics.index_used = Some(ix_name);
-                }
+            let preds = extract_column_predicates(expr);
+            if let Some((ix_idx, plan)) = self.match_index_plan(&schema.name, &preds) {
+                let ix_name = self.catalog.indexes[ix_idx].name.clone();
+                let (matched_locs, b_read) = match plan {
+                    IndexPlan::Hash(tuples) => self.lookup_hash_index(ix_idx, &tuples)?,
+                    IndexPlan::BTree(specs) => self.lookup_btree_index(ix_idx, &specs)?,
+                };
+                metrics.index_blocks_read += b_read;
+                metrics.index_used = Some(ix_name);
+                allowed_locs = Some(matched_locs);
             }
         }
 
@@ -1682,18 +3395,104 @@ impl Database {
 
         let mut results = Vec::new();
 
-        for (p_i, slot_filter) in candidate_pages {
-            let page_meta = &pages[p_i];
-            metrics.pages_scanned += 1;
+        // Parallel Sequential Scan & Filter when scanning >= 4 pages without cache-fill!
+        let num_workers = self.pool.worker_count();
+        if candidate_pages.len() >= 4
+            && num_workers > 1
+            && !use_cache_fill
+            && allowed_locs.is_none()
+        {
+            let eff_workers = num_workers.min(candidate_pages.len());
+            metrics.parallel_workers = eff_workers;
+            metrics.pages_scanned = candidate_pages.len();
+            let path = self.path.clone();
+            let pages_ref = &pages;
+            let cand_ref = &candidate_pages;
+            let schema_ref = &schema;
+            let es_ref = &eval_schema;
 
-            if let Some(cached_rows) = self.cache.get(page_meta.page_id) {
-                metrics.cache_hits += 1;
+            let shard_results: Vec<Result<Vec<Row>>> =
+                self.pool.execute_shards(eff_workers, |shard_id, total_shards| {
+                    let chunk = (cand_ref.len() + total_shards - 1) / total_shards;
+                    let start = shard_id * chunk;
+                    if start >= cand_ref.len() {
+                        return Ok(Vec::new());
+                    }
+                    let end = (start + chunk).min(cand_ref.len());
+                    let mut f = File::open(&path)?;
+                    let mut local = Vec::new();
+                    for &(p_i, _) in &cand_ref[start..end] {
+                        let page_meta = &pages_ref[p_i];
+                        let page_rows =
+                            read_pax_page_from_file(&mut f, schema_ref, page_meta, needed_cols)?;
+                        for (slot, row) in page_rows.into_iter().enumerate() {
+                            if page_meta.is_deleted(slot as u32) {
+                                continue;
+                            }
+                            if let Some(expr) = where_clause {
+                                if eval_bool_fast(expr, es_ref, &row)? != Some(true) {
+                                    continue;
+                                }
+                            }
+                            local.push(row);
+                        }
+                    }
+                    Ok(local)
+                });
+            for sr in shard_results {
+                results.extend(sr?);
+            }
+        } else {
+            for (p_i, slot_filter) in candidate_pages {
+                let page_meta = &pages[p_i];
+                metrics.pages_scanned += 1;
+
+                if let Some(cached_rows) = self.cache.get(page_meta.page_id) {
+                    metrics.cache_hits += 1;
+                    if let Some(slots) = slot_filter {
+                        for &slot in slots {
+                            if page_meta.is_deleted(slot) {
+                                continue;
+                            }
+                            if let Some(row) = cached_rows.get(slot as usize) {
+                                if let Some(expr) = where_clause {
+                                    if eval_bool_fast(expr, &eval_schema, row)? != Some(true) {
+                                        continue;
+                                    }
+                                }
+                                results.push(row.clone());
+                            }
+                        }
+                    } else {
+                        for (slot, row) in cached_rows.iter().enumerate() {
+                            if page_meta.is_deleted(slot as u32) {
+                                continue;
+                            }
+                            if let Some(expr) = where_clause {
+                                if eval_bool_fast(expr, &eval_schema, row)? != Some(true) {
+                                    continue;
+                                }
+                            }
+                            results.push(row.clone());
+                        }
+                    }
+                    continue;
+                }
+
+                let page_rows = if use_cache_fill {
+                    let full = self.storage.read_pax_page(&schema, page_meta, None)?;
+                    self.cache.insert(page_meta.page_id, full.clone());
+                    full
+                } else {
+                    self.storage.read_pax_page(&schema, page_meta, needed_cols)?
+                };
+
                 if let Some(slots) = slot_filter {
                     for &slot in slots {
                         if page_meta.is_deleted(slot) {
                             continue;
                         }
-                        if let Some(row) = cached_rows.get(slot as usize) {
+                        if let Some(row) = page_rows.get(slot as usize) {
                             if let Some(expr) = where_clause {
                                 if eval_bool_fast(expr, &eval_schema, row)? != Some(true) {
                                     continue;
@@ -1703,54 +3502,17 @@ impl Database {
                         }
                     }
                 } else {
-                    for (slot, row) in cached_rows.iter().enumerate() {
+                    for (slot, row) in page_rows.into_iter().enumerate() {
                         if page_meta.is_deleted(slot as u32) {
                             continue;
                         }
                         if let Some(expr) = where_clause {
-                            if eval_bool_fast(expr, &eval_schema, row)? != Some(true) {
+                            if eval_bool_fast(expr, &eval_schema, &row)? != Some(true) {
                                 continue;
                             }
                         }
-                        results.push(row.clone());
+                        results.push(row);
                     }
-                }
-                continue;
-            }
-
-            let page_rows = if use_cache_fill {
-                let full = self.storage.read_pax_page(&schema, page_meta, None)?;
-                self.cache.insert(page_meta.page_id, full.clone());
-                full
-            } else {
-                self.storage.read_pax_page(&schema, page_meta, needed_cols)?
-            };
-
-            if let Some(slots) = slot_filter {
-                for &slot in slots {
-                    if page_meta.is_deleted(slot) {
-                        continue;
-                    }
-                    if let Some(row) = page_rows.get(slot as usize) {
-                        if let Some(expr) = where_clause {
-                            if eval_bool_fast(expr, &eval_schema, row)? != Some(true) {
-                                continue;
-                            }
-                        }
-                        results.push(row.clone());
-                    }
-                }
-            } else {
-                for (slot, row) in page_rows.into_iter().enumerate() {
-                    if page_meta.is_deleted(slot as u32) {
-                        continue;
-                    }
-                    if let Some(expr) = where_clause {
-                        if eval_bool_fast(expr, &eval_schema, &row)? != Some(true) {
-                            continue;
-                        }
-                    }
-                    results.push(row);
                 }
             }
         }
@@ -1828,6 +3590,39 @@ impl Database {
         if matched.is_empty() {
             return Ok(0);
         }
+
+        let has_refs = self.foreign_keys_enabled && !self.find_referencing_fks(&canonical).is_empty();
+        if has_refs {
+            // Use internal savepoint so any mid-cascade FK error rolls back atomically!
+            self.savepoint("__fk_delete_guard")?;
+            let res: Result<usize> = (|| {
+                let mut visited: HashSet<(String, i64)> = matched
+                    .iter()
+                    .map(|r| (canonical.to_ascii_lowercase(), r.rowid))
+                    .collect();
+                let rowids: Vec<i64> = matched.iter().map(|r| r.rowid).collect();
+                let set: HashSet<i64> = rowids.iter().copied().collect();
+                let count = self.mark_rowids_deleted_in_memory(&canonical, &set)?;
+                self.record_wal_op(WalOp::DeleteRowIds {
+                    table_name: canonical.clone(),
+                    rowids,
+                })?;
+                self.enforce_parent_delete_cascades(&canonical, &matched, &mut visited)?;
+                Ok(count)
+            })();
+            match res {
+                Ok(count) => {
+                    self.release_savepoint("__fk_delete_guard")?;
+                    return Ok(count);
+                }
+                Err(e) => {
+                    let _ = self.rollback_to_savepoint("__fk_delete_guard");
+                    let _ = self.release_savepoint("__fk_delete_guard");
+                    return Err(e);
+                }
+            }
+        }
+
         let rowids: Vec<i64> = matched.iter().map(|r| r.rowid).collect();
         let set: HashSet<i64> = rowids.iter().copied().collect();
         let count = self.mark_rowids_deleted_in_memory(&canonical, &set)?;
@@ -1870,6 +3665,7 @@ impl Database {
         let mut next_rowid = schema.next_rowid;
         let mut rowid_changed = false;
         let mut updated_rows = Vec::with_capacity(matched.len());
+        let mut changed_pairs = Vec::with_capacity(matched.len());
         let mut old_ids = HashSet::with_capacity(matched.len());
         let mut old_ids_vec = Vec::with_capacity(matched.len());
         for mut row in matched {
@@ -1888,7 +3684,6 @@ impl Database {
                 }
                 row.values[c_idx] = coerced;
             }
-            // Keep internal `rowid` synchronized if an `INTEGER PRIMARY KEY` column was updated!
             if let Some(pk_i) = pk_col {
                 if let Value::Integer(new_pk) = row.values[pk_i] {
                     if new_pk != row.rowid {
@@ -1900,10 +3695,57 @@ impl Database {
                     }
                 }
             }
+            changed_pairs.push((orig, row.clone()));
             updated_rows.push(row);
         }
 
+        self.check_row_constraints(&schema, &updated_rows)?;
         self.check_unique_constraints(&canonical, &schema, &updated_rows, Some(&old_ids))?;
+        self.check_foreign_keys_on_write(&schema, &updated_rows)?;
+
+        let has_refs = self.foreign_keys_enabled && !self.find_referencing_fks(&canonical).is_empty();
+        if has_refs {
+            self.savepoint("__fk_update_guard")?;
+            let res: Result<usize> = (|| {
+                let count = updated_rows.len();
+                self.catalog.tables[idx].schema.next_rowid = next_rowid;
+                self.mark_rowids_deleted_in_memory(&canonical, &old_ids)?;
+                self.hot_buffers
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(updated_rows.clone());
+                if rowid_changed {
+                    self.record_wal_ops(vec![
+                        WalOp::DeleteRowIds {
+                            table_name: canonical.clone(),
+                            rowids: old_ids_vec.clone(),
+                        },
+                        WalOp::InsertRows {
+                            table_name: canonical.clone(),
+                            rows: updated_rows.clone(),
+                        },
+                    ])?;
+                } else {
+                    self.record_wal_op(WalOp::UpdateRows {
+                        table_name: canonical.clone(),
+                        rows: updated_rows.clone(),
+                    })?;
+                }
+                self.enforce_parent_update_cascades(&canonical, &changed_pairs)?;
+                Ok(count)
+            })();
+            match res {
+                Ok(count) => {
+                    self.release_savepoint("__fk_update_guard")?;
+                    return Ok(count);
+                }
+                Err(e) => {
+                    let _ = self.rollback_to_savepoint("__fk_update_guard");
+                    let _ = self.release_savepoint("__fk_update_guard");
+                    return Err(e);
+                }
+            }
+        }
 
         let count = updated_rows.len();
         self.catalog.tables[idx].schema.next_rowid = next_rowid;
@@ -1914,7 +3756,6 @@ impl Database {
             .extend(updated_rows.clone());
 
         if rowid_changed {
-            // Write DeleteRowIds + InsertRows in ONE atomic WAL frame BEFORE maybe_auto_checkpoint!
             self.record_wal_ops(vec![
                 WalOp::DeleteRowIds {
                     table_name: canonical.clone(),
@@ -1934,11 +3775,8 @@ impl Database {
         Ok(count)
     }
 
-    /// Creates a consistent, self-contained single-file backup of the database at `dest`.
-    /// Flushes pending WAL frames first (when writable), fsyncs the temp copy, and atomically
-    /// replaces `dest` without ever deleting an existing backup first.
     pub fn backup_to<P: AsRef<Path>>(&mut self, dest: P) -> Result<()> {
-        if !self.read_only && self.active_tx.is_none() && self.dirty {
+        if !self.read_only && !self.mvcc_sandbox && self.active_tx.is_none() && self.dirty {
             self.checkpoint()?;
         }
         let dest_path = dest.as_ref();
@@ -1962,7 +3800,7 @@ impl Database {
     }
 
     // ========================================================================
-    // Checkpoint & Vacuum (with Paged Index Compaction + Global Sort-Key Clustering)
+    // Checkpoint & Vacuum (Parallel PAX Page Compression + Paged B-Tree/Hash Compaction)
     // ========================================================================
 
     pub fn checkpoint(&mut self) -> Result<()> {
@@ -2022,16 +3860,30 @@ impl Database {
                 if !schema.cluster_by.is_empty() {
                     sort_rows_by_cluster(&schema, &mut pending);
                 }
-                for chunk in pending.chunks(page_rows) {
-                    let meta = self.storage.write_pax_page(&schema, chunk, profile)?;
-                    let pid = meta.page_id;
-                    self.catalog.tables[t_idx].pages.push(meta);
-                    self.update_indexes_for_new_page(&schema, pid, chunk);
+                let chunks: Vec<&[Row]> = pending.chunks(page_rows).collect();
+                if chunks.len() >= 2 && self.pool.worker_count() > 1 {
+                    let encoded: Vec<Result<_>> = self
+                        .pool
+                        .execute_indexed(&chunks, |_, chunk| {
+                            encode_pax_page(&schema, chunk, profile)
+                        });
+                    for (chunk, enc_res) in chunks.into_iter().zip(encoded) {
+                        let meta = self.storage.write_encoded_pax_page(enc_res?)?;
+                        let pid = meta.page_id;
+                        self.catalog.tables[t_idx].pages.push(meta);
+                        self.update_indexes_for_new_page(&schema, pid, chunk);
+                    }
+                } else {
+                    for chunk in chunks {
+                        let meta = self.storage.write_pax_page(&schema, chunk, profile)?;
+                        let pid = meta.page_id;
+                        self.catalog.tables[t_idx].pages.push(meta);
+                        self.update_indexes_for_new_page(&schema, pid, chunk);
+                    }
                 }
             }
         }
 
-        // Flush dirty secondary indexes into compressed paged SSTable blocks!
         self.flush_dirty_indexes()?;
         self.storage.commit_catalog(&self.catalog, profile)?;
         self.wal.truncate()?;
@@ -2064,10 +3916,13 @@ impl Database {
             .indexes
             .iter()
             .map(|i| {
-                IndexEntry::new(
+                IndexEntry::new_composite(
                     i.name.clone(),
                     i.table_name.clone(),
-                    i.column_name.clone(),
+                    i.columns.clone(),
+                    i.desc.clone(),
+                    i.kind,
+                    i.unique,
                 )
             })
             .collect();
@@ -2077,35 +3932,83 @@ impl Database {
             let mut live_rows = self.scan_all(&schema.name)?;
             sort_rows_by_cluster(&schema, &mut live_rows);
 
-            let mut new_pages = Vec::new();
-            for chunk in live_rows.chunks(page_rows) {
-                let meta = new_storage.write_pax_page(&schema, chunk, profile)?;
-                let pid = meta.page_id;
-                for ix in &mut new_indexes {
-                    if ix.table_name.eq_ignore_ascii_case(&schema.name) {
-                        if let Some(c_idx) = schema.col_index(&ix.column_name) {
-                            let vals: Vec<Value> =
-                                chunk.iter().map(|r| r.values[c_idx].clone()).collect();
-                            ix.index_page_values(pid, &vals);
+            let chunks: Vec<&[Row]> = live_rows.chunks(page_rows).collect();
+            let mut new_pages = Vec::with_capacity(chunks.len());
+
+            if chunks.len() >= 2 && self.pool.worker_count() > 1 {
+                let encoded: Vec<Result<_>> = self
+                    .pool
+                    .execute_indexed(&chunks, |_, chunk| {
+                        encode_pax_page(&schema, chunk, profile)
+                    });
+                for (chunk, enc_res) in chunks.into_iter().zip(encoded) {
+                    let meta = new_storage.write_encoded_pax_page(enc_res?)?;
+                    let pid = meta.page_id;
+                    for ix in &mut new_indexes {
+                        if ix.table_name.eq_ignore_ascii_case(&schema.name) {
+                            let cis: Option<Vec<usize>> =
+                                ix.columns.iter().map(|c| schema.col_index(c)).collect();
+                            if let Some(cis) = cis {
+                                let tuples: Vec<Vec<Value>> = chunk
+                                    .iter()
+                                    .map(|r| cis.iter().map(|&ci| r.values[ci].clone()).collect())
+                                    .collect();
+                                ix.index_page_tuples(pid, tuples);
+                            }
                         }
                     }
+                    new_pages.push(meta);
                 }
-                new_pages.push(meta);
+            } else {
+                for chunk in chunks {
+                    let meta = new_storage.write_pax_page(&schema, chunk, profile)?;
+                    let pid = meta.page_id;
+                    for ix in &mut new_indexes {
+                        if ix.table_name.eq_ignore_ascii_case(&schema.name) {
+                            let cis: Option<Vec<usize>> =
+                                ix.columns.iter().map(|c| schema.col_index(c)).collect();
+                            if let Some(cis) = cis {
+                                let tuples: Vec<Vec<Value>> = chunk
+                                    .iter()
+                                    .map(|r| cis.iter().map(|&ci| r.values[ci].clone()).collect())
+                                    .collect();
+                                ix.index_page_tuples(pid, tuples);
+                            }
+                        }
+                    }
+                    new_pages.push(meta);
+                }
             }
+
             new_catalog.tables.push(TableEntry {
                 schema,
                 pages: new_pages,
             });
         }
 
-        // Write clean sorted on-disk index leaf blocks into the fresh compacted file!
+        // Write clean sorted on-disk index leaf blocks into the fresh compacted file
         for ix in &mut new_indexes {
-            let entries = std::mem::take(&mut ix.pending_entries);
-            let mut blocks = Vec::new();
-            for chunk in entries.chunks(INDEX_BLOCK_ENTRIES) {
-                blocks.push(new_storage.write_index_block(chunk, profile)?);
+            match ix.kind {
+                IndexKind::Hash => {
+                    let entries = std::mem::take(&mut ix.pending_entries);
+                    let mut blocks = Vec::new();
+                    for chunk in entries.chunks(INDEX_BLOCK_ENTRIES) {
+                        blocks.push(new_storage.write_index_block(chunk, profile)?);
+                    }
+                    ix.blocks = blocks;
+                }
+                IndexKind::BTree => {
+                    let entries = std::mem::take(&mut ix.pending_btree);
+                    let key_cols = ix.columns.len();
+                    let mut blocks = Vec::new();
+                    for chunk in entries.chunks(INDEX_BLOCK_ENTRIES) {
+                        blocks.push(
+                            new_storage.write_btree_index_block(chunk, key_cols, profile)?,
+                        );
+                    }
+                    ix.btree_blocks = blocks;
+                }
             }
-            ix.blocks = blocks;
         }
         new_catalog.indexes = new_indexes;
 
@@ -2179,11 +4082,18 @@ impl Database {
     }
 }
 
+enum IndexPlan {
+    Hash(Vec<Vec<Value>>),
+    BTree(Vec<BTreeScanSpec>),
+}
+
 impl Drop for Database {
     fn drop(&mut self) {
-        if !self.read_only && self.active_tx.is_none() && self.dirty {
+        if !self.read_only && !self.mvcc_sandbox && self.active_tx.is_none() && self.dirty {
             let _ = self.checkpoint();
         }
-        self.wal.remove_if_empty();
+        if !self.mvcc_sandbox {
+            self.wal.remove_if_empty();
+        }
     }
 }

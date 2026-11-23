@@ -26,7 +26,7 @@
   <rect class="bar-parquet" x="184" y="48" width="10" height="10" rx="2" />
   <text class="legend" x="200" y="57">Parquet (Zstd L9)</text>
   <rect class="bar-squish" x="328" y="48" width="10" height="10" rx="2" />
-  <text class="legend" x="344" y="57">SquishDB v0.4</text>
+  <text class="legend" x="344" y="57">SquishDB v0.5</text>
 
   <!-- Gridlines: x=195 (0 MB) to x=595 (15 MB), 26.67 px/MB -->
   <line class="grid" x1="195" y1="74" x2="195" y2="364" />
@@ -42,46 +42,46 @@
   <!-- Row 1: IoT clustered (150k rows) -->
   <text class="label" x="24" y="97">IoT clustered</text>
   <text class="sub" x="24" y="112">150k rows</text>
-  <rect class="bar-sqlite" x="195" y="82" width="208.5" height="11" rx="2" />
-  <text class="val" x="410" y="91">7.82 MB</text>
-  <rect class="bar-parquet" x="195" y="96" width="40.0" height="11" rx="2" />
-  <text class="val" x="242" y="105">1.50 MB</text>
+  <rect class="bar-sqlite" x="195" y="82" width="208.6" height="11" rx="2" />
+  <text class="val" x="410.1" y="91">7.82 MB</text>
+  <rect class="bar-parquet" x="195" y="96" width="40.1" height="11" rx="2" />
+  <text class="val" x="241.6" y="105">1.50 MB</text>
   <rect class="bar-squish" x="195" y="110" width="10.7" height="11" rx="2" />
-  <text class="val-sq" x="212" y="119">0.40 MB (19.4x smaller)</text>
+  <text class="val-sq" x="212.2" y="119">0.40 MB (19.4x smaller)</text>
 
   <!-- Row 2: JSON telemetry logs (80k rows) -->
   <text class="label" x="24" y="157">JSON telemetry logs</text>
   <text class="sub" x="24" y="172">80k rows</text>
-  <rect class="bar-sqlite" x="195" y="142" width="394.9" height="11" rx="2" />
-  <text class="val" x="596" y="151">14.81 MB</text>
+  <rect class="bar-sqlite" x="195" y="142" width="395.0" height="11" rx="2" />
+  <text class="val" x="596.5" y="151">14.81 MB</text>
   <rect class="bar-parquet" x="195" y="156" width="39.2" height="11" rx="2" />
-  <text class="val" x="241" y="165">1.47 MB</text>
+  <text class="val" x="240.7" y="165">1.47 MB</text>
   <rect class="bar-squish" x="195" y="170" width="28.0" height="11" rx="2" />
-  <text class="val-sq" x="230" y="179">1.05 MB (14.1x smaller)</text>
+  <text class="val-sq" x="229.5" y="179">1.05 MB (14.1x smaller)</text>
 
   <!-- Row 3: Analytical dataset (100k rows) -->
   <text class="label" x="24" y="216">Analytical table</text>
   <text class="sub" x="24" y="231">100k rows</text>
   <rect class="bar-sqlite" x="195" y="204" width="245.6" height="12" rx="2" />
-  <text class="val" x="447" y="214">9.21 MB</text>
+  <text class="val" x="447.1" y="214">9.21 MB</text>
   <rect class="bar-squish" x="195" y="220" width="34.4" height="12" rx="2" />
-  <text class="val-sq" x="236" y="230">1.29 MB (7.1x smaller)</text>
+  <text class="val-sq" x="235.9" y="230">1.29 MB (7.1x smaller)</text>
 
-  <!-- Row 4: UUID indexed table (40k rows) -->
+  <!-- Row 4: UUID B-tree indexed table (40k rows) -->
   <text class="label" x="24" y="268">UUID indexed table</text>
-  <text class="sub" x="24" y="283">40k rows + index</text>
-  <rect class="bar-sqlite" x="195" y="256" width="123.7" height="12" rx="2" />
-  <text class="val" x="325" y="266">4.64 MB</text>
-  <rect class="bar-squish" x="195" y="272" width="50.4" height="12" rx="2" />
-  <text class="val-sq" x="252" y="282">1.89 MB (2.5x smaller)</text>
+  <text class="sub" x="24" y="283">40k rows + B-tree</text>
+  <rect class="bar-sqlite" x="195" y="256" width="123.9" height="12" rx="2" />
+  <text class="val" x="325.4" y="266">4.64 MB</text>
+  <rect class="bar-squish" x="195" y="272" width="63.8" height="12" rx="2" />
+  <text class="val-sq" x="265.3" y="282">2.39 MB (1.9x smaller)</text>
 
   <!-- Row 5: Random 4 KB blobs (entropy limit) -->
   <text class="label" x="24" y="325">Random 4 KB blobs</text>
   <text class="sub" x="24" y="340">Incompressible</text>
-  <rect class="bar-sqlite" x="195" y="310" width="234.7" height="11" rx="2" />
-  <text class="val" x="436" y="319">8.80 MB</text>
+  <rect class="bar-sqlite" x="195" y="310" width="234.6" height="11" rx="2" />
+  <text class="val" x="436.1" y="319">8.80 MB</text>
   <rect class="bar-parquet" x="195" y="324" width="209.3" height="11" rx="2" />
-  <text class="val" x="411" y="333">7.85 MB</text>
-  <rect class="bar-squish" x="195" y="338" width="208.3" height="11" rx="2" />
-  <text class="val-sq" x="410" y="347">7.81 MB (+0.57 B/row)</text>
+  <text class="val" x="410.8" y="333">7.85 MB</text>
+  <rect class="bar-squish" x="195" y="338" width="208.4" height="11" rx="2" />
+  <text class="val-sq" x="409.9" y="347">7.81 MB (+0.57 B/row)</text>
 </svg>

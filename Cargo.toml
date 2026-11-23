@@ -1,6 +1,6 @@
 [package]
 name = "squishdb"
-version = "0.4.0-alpha.1"
+version = "0.5.0-alpha.1"
 edition = "2021"
 license = "MIT"
 description = "Single-file embedded SQL database with PAX-v4 columnar pages and lossless per-column compression."

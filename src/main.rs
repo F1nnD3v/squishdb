@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -5,17 +6,19 @@ use std::time::Instant;
 
 use squishdb::pax::CompressionProfile;
 use squishdb::types::{ColumnDef, ColumnType, Error, Result, Value};
-use squishdb::{Database, DbOptions, QueryResult};
+use squishdb::{migrate_sqlite, Database, DbOptions, MigrateOptions, QueryResult};
 
 const MAX_STREAM_ITEM_BYTES: usize = 256 * 1024 * 1024; // 256 MiB safety cap
 
 fn print_usage() {
-    eprintln!("SquishDB v0.4.0-alpha.1, a compressed single-file SQL database.");
+    eprintln!("SquishDB v0.5.0-alpha.1, a compressed single-file SQL database.");
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  squishdb <file.sqdb>                                  Interactive SQL REPL");
     eprintln!("  squishdb <file.sqdb> -c \"<SQL>\"                       Execute SQL statement(s)");
     eprintln!("  squishdb stats <file.sqdb>                            Show storage, index & cache stats");
+    eprintln!("  squishdb migrate <src.sqlite> <dst.sqdb> [--profile P] [--cluster tbl:c1,c2] [--threads N]");
+    eprintln!("                                                        Migrate SQLite 3 file directly to .sqdb");
     eprintln!("  squishdb import-bin <file.sqdb> [profile] [col1,col2] Bulk import (+ optional cluster keys)");
     eprintln!("  squishdb export-bin <file.sqdb> <table>               Exact lossless binary export");
     eprintln!("  squishdb bench-lookup <file.sqdb> < queries.sql       Measure query latency from stdin");
@@ -368,6 +371,61 @@ fn main() {
             Database::open(&args[2]).and_then(|db| {
                 println!("{}", db.stats()?.format_report());
                 Ok(())
+            })
+        }
+        "migrate" | "import-sqlite" => {
+            if args.len() < 4 {
+                print_usage();
+                std::process::exit(1);
+            }
+            let src = Path::new(&args[2]);
+            let dst = Path::new(&args[3]);
+            let mut mopts = MigrateOptions::default();
+            let mut cluster_map: HashMap<String, Vec<String>> = HashMap::new();
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--profile" if i + 1 < args.len() => {
+                        mopts.compression = parse_profile(&args[i + 1]);
+                        i += 1;
+                    }
+                    "--threads" if i + 1 < args.len() => {
+                        mopts.parallel_workers = args[i + 1].parse().unwrap_or(0);
+                        i += 1;
+                    }
+                    "--cluster" if i + 1 < args.len() => {
+                        if let Some((tbl, cols)) = args[i + 1].split_once(':') {
+                            let list: Vec<String> = cols
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            cluster_map.insert(tbl.trim().to_ascii_lowercase(), list);
+                        }
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            mopts.cluster_by = cluster_map;
+            let t0 = Instant::now();
+            migrate_sqlite(src, dst, mopts).map(|rep| {
+                let ratio = if rep.sqdb_bytes > 0 {
+                    (rep.sqlite_bytes as f64) / (rep.sqdb_bytes as f64)
+                } else {
+                    1.0
+                };
+                println!(
+                    "Migrated {} tables, {} indexes, {} rows in {:.2}s: {} bytes -> {} bytes ({:.2}x smaller)",
+                    rep.tables_migrated,
+                    rep.indexes_migrated,
+                    rep.total_rows,
+                    t0.elapsed().as_secs_f64(),
+                    rep.sqlite_bytes,
+                    rep.sqdb_bytes,
+                    ratio
+                );
             })
         }
         "import-bin" => {

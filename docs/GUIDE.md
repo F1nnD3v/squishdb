@@ -1,6 +1,6 @@
 # SquishDB installation and usage guide
 
-Version `v0.4.0-alpha.1` (`SQSHDB04` PAX-v4 format).
+Version `v0.5.0-alpha.1` (`SQSHDB05` PAX-v4 format with automatic forward migration from `SQSHDB04`).
 
 ## Prerequisites and installation
 
@@ -39,9 +39,13 @@ squishdb = { git = "https://github.com/F1nnD3v/squishdb" }
 squishdb <file.sqdb>                                  Interactive SQL REPL
 squishdb <file.sqdb> -c "<SQL>"                       Execute SQL statement(s)
 squishdb stats <file.sqdb>                            Show storage, index & cache stats
+squishdb migrate <src.sqlite> <dst.sqdb> [--profile P] [--cluster tbl:c1,c2] [--threads N]
+                                                      Migrate SQLite 3 database directly to .sqdb
 squishdb import-bin <file.sqdb> [profile] [col1,col2] Bulk import (+ optional cluster keys)
 squishdb export-bin <file.sqdb> <table>               Exact lossless binary export
 squishdb bench-lookup <file.sqdb> < queries.sql       Measure query latency from stdin
+squishdb rpc <file.sqdb> [--readonly] [--profile P] [--sync-wal]
+                                                      Persistent JSON-RPC over stdio
 ```
 
 Compression profiles are `fast`, `balanced` (default), `max`, and `none`.
@@ -111,7 +115,7 @@ use squishdb::pax::CompressionProfile;
 // Default: Balanced compression, 4,096 rows per page, buffered WAL
 let mut db = Database::open("data.sqdb")?;
 
-// Strict durability and higher compression
+// Strict durability, higher compression, and 4 parallel query workers
 let opts = DbOptions {
     page_rows: 4096,
     compression: CompressionProfile::Max,
@@ -119,11 +123,16 @@ let opts = DbOptions {
     auto_checkpoint_rows: 16384,
     cache_pages: 128,
     index_cache_blocks: 64,
+    parallel_workers: 4,
 };
 let mut durable_db = Database::open_with_options("durable.sqdb", opts)?;
 
 // Shared read-only connection (multiple readers can open the same file at once)
-let mut ro_db = Database::open_read_only("data.sqdb")?;
+let mut ro_db = Database::open_readonly("data.sqdb")?;
+
+// Multi-threaded multi-writer MVCC engine
+let shared = squishdb::SharedDatabase::open("concurrent.sqdb")?;
+let mut conn = shared.connect();
 ```
 
 ### Running queries
@@ -219,18 +228,22 @@ db.backup_to("metrics-backup.sqdb")?;
 ```sql
 CREATE TABLE [IF NOT EXISTS] name (
     id INTEGER PRIMARY KEY [AUTOINCREMENT],
+    parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE ON UPDATE RESTRICT,
     code TEXT UNIQUE NOT NULL,
     status TEXT DEFAULT 'active',
-    score REAL
+    score REAL CHECK (score >= 0.0),
+    CONSTRAINT chk_score CHECK (score <= 100.0),
+    FOREIGN KEY (parent_id) REFERENCES parents(id) ON DELETE SET NULL
 ) [CLUSTER BY (col1, col2)];
 
 -- Metadata-only column add; older pages fill the default or NULL lazily on read
-ALTER TABLE name ADD [COLUMN] extra_col INTEGER DEFAULT 0;
+ALTER TABLE name ADD [COLUMN] extra_col INTEGER DEFAULT 0 CHECK (extra_col >= 0);
 
 -- Change clustering keys for the next VACUUM
 ALTER TABLE name CLUSTER BY (status, id);
 
-CREATE INDEX [IF NOT EXISTS] idx_name ON table_name(column_name);
+-- Single-column or composite B-tree (default) and optional HASH indexes
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON table_name [USING BTREE|HASH] (col1 [ASC|DESC], col2 [ASC|DESC]);
 DROP INDEX [IF EXISTS] idx_name;
 DROP TABLE [IF EXISTS] table_name;
 ```
@@ -272,8 +285,15 @@ Supported query syntax:
 ```sql
 BEGIN [TRANSACTION];
 UPDATE users SET plan = 'pro' WHERE id IN (SELECT user_id FROM upgrades);
+SAVEPOINT sp1;
 DELETE FROM logs WHERE ts < 1700000000;
+ROLLBACK [TRANSACTION] TO [SAVEPOINT] sp1;
+RELEASE [SAVEPOINT] sp1;
 COMMIT [TRANSACTION];   -- or ROLLBACK [TRANSACTION];
+
+SET max_parallel_workers = 4;      -- configure parallel scan / GROUP BY workers
+PRAGMA foreign_keys = ON;          -- toggle foreign key enforcement (ON by default)
+PRAGMA format_version;             -- inspect on-disk format version (5)
 
 CHECKPOINT;                        -- flush WAL and hot buffers into PAX-v4 pages
 VACUUM;                            -- reclaim deleted slots and re-cluster all tables
