@@ -45,7 +45,59 @@ pub struct Superblock {
     pub data_end_offset: u64,
 }
 
+enum SuperblockSlot {
+    Valid(Superblock),
+    Unsupported {
+        version: u32,
+        generation: u64,
+        err: Error,
+    },
+    Invalid,
+}
+
 impl Superblock {
+    fn inspect_slot(buf: &[u8; SUPERBLOCK_SIZE as usize]) -> SuperblockSlot {
+        if &buf[0..6] != b"SQSHDB" {
+            return SuperblockSlot::Invalid;
+        }
+        let expected_crc = u32::from_le_bytes(buf[508..512].try_into().unwrap());
+        let actual_crc = crc32fast::hash(&buf[0..508]);
+        if expected_crc != actual_crc {
+            return SuperblockSlot::Invalid;
+        }
+        let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let generation = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+        if version > FORMAT_VERSION {
+            return SuperblockSlot::Unsupported {
+                version,
+                generation,
+                err: Error::Schema(format!(
+                    "Database on-disk format v{} is newer than supported format v{}; upgrade SquishDB",
+                    version, FORMAT_VERSION
+                )),
+            };
+        }
+        if version < MIN_SUPPORTED_FORMAT_VERSION {
+            return SuperblockSlot::Unsupported {
+                version,
+                generation,
+                err: Error::Schema(format!(
+                    "Database on-disk format v{} is below minimum supported v{}",
+                    version, MIN_SUPPORTED_FORMAT_VERSION
+                )),
+            };
+        }
+        match Self::deserialize_checked(buf) {
+            Ok(Some(sb)) => SuperblockSlot::Valid(sb),
+            Ok(None) => SuperblockSlot::Invalid,
+            Err(err) => SuperblockSlot::Unsupported {
+                version,
+                generation,
+                err,
+            },
+        }
+    }
+
     pub fn empty() -> Self {
         Superblock {
             version: FORMAT_VERSION,
@@ -799,20 +851,48 @@ impl StorageFile {
         sf.file.read_exact(&mut buf_a)?;
         sf.file.read_exact(&mut buf_b)?;
 
-        let sb_a = Superblock::deserialize_checked(&buf_a)?;
-        let sb_b = Superblock::deserialize_checked(&buf_b)?;
+        let slot_a = Superblock::inspect_slot(&buf_a);
+        let slot_b = Superblock::inspect_slot(&buf_b);
 
-        let (sb, slot) = match (sb_a, sb_b) {
-            (Some(a), Some(b)) => {
+        let (sb, slot) = match (slot_a, slot_b) {
+            (SuperblockSlot::Valid(a), SuperblockSlot::Valid(b)) => {
                 if b.generation > a.generation {
                     (b, 1u8)
                 } else {
                     (a, 0u8)
                 }
             }
-            (Some(a), None) => (a, 0u8),
-            (None, Some(b)) => (b, 1u8),
-            (None, None) => {
+            (SuperblockSlot::Valid(a), SuperblockSlot::Invalid) => (a, 0u8),
+            (SuperblockSlot::Invalid, SuperblockSlot::Valid(b)) => (b, 1u8),
+            (
+                SuperblockSlot::Valid(a),
+                SuperblockSlot::Unsupported {
+                    version,
+                    generation,
+                    err,
+                },
+            ) => {
+                if version > FORMAT_VERSION && generation > a.generation {
+                    return Err(err);
+                }
+                (a, 0u8)
+            }
+            (
+                SuperblockSlot::Unsupported {
+                    version,
+                    generation,
+                    err,
+                },
+                SuperblockSlot::Valid(b),
+            ) => {
+                if version > FORMAT_VERSION && generation > b.generation {
+                    return Err(err);
+                }
+                (b, 1u8)
+            }
+            (SuperblockSlot::Unsupported { err, .. }, _)
+            | (_, SuperblockSlot::Unsupported { err, .. }) => return Err(err),
+            (SuperblockSlot::Invalid, SuperblockSlot::Invalid) => {
                 return Err(Error::Corruption(
                     "Both A/B superblocks are missing or corrupted (or incompatible format version)"
                         .into(),

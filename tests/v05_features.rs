@@ -1129,3 +1129,306 @@ fn test_audit_sqlite_corrupted_wal_frame_checksum_rejected() {
     let _ = std::fs::remove_file(&wal_path);
     cleanup(&sqdb_path);
 }
+
+#[test]
+fn test_audit2_mvcc_self_insert_update_delete_remapped_rowid() {
+    let path = temp_db("audit2_mvcc_remap");
+    {
+        let shared = SharedDatabase::open(&path).unwrap();
+        let mut setup = shared.connect();
+        setup
+            .execute("CREATE TABLE notes (tag TEXT, val INTEGER);")
+            .unwrap();
+
+        let mut c1 = shared.connect();
+        let mut c2 = shared.connect();
+        c1.begin().unwrap();
+        c2.begin().unwrap();
+
+        // Both connections insert into the same rowid-only table from the same snapshot,
+        // so both assign local rowid 1 in their sandboxes.
+        c1.execute("INSERT INTO notes VALUES ('c1', 10);").unwrap();
+        c1.commit().unwrap();
+
+        // c2 inserts two rows (local rowids 1 and 2), updates local rowid 1, and deletes local rowid 2.
+        c2.execute("INSERT INTO notes VALUES ('c2', 20);").unwrap();
+        c2.execute("INSERT INTO notes VALUES ('c2_del', 30);").unwrap();
+        c2.execute("UPDATE notes SET val = 200 WHERE tag = 'c2';")
+            .unwrap();
+        c2.execute("DELETE FROM notes WHERE tag = 'c2_del';")
+            .unwrap();
+        c2.commit().unwrap();
+
+        let mut verify = shared.connect_readonly();
+        let res = verify
+            .execute("SELECT tag, val FROM notes ORDER BY tag ASC;")
+            .unwrap();
+        let rows = rows_of(&res);
+        assert_eq!(rows.len(), 2, "Expected 2 rows, got {:?}", rows);
+        assert!(rows[0][0].exact_eq(&Value::Text("c1".into())));
+        assert!(rows[0][1].exact_eq(&Value::Integer(10)));
+        assert!(rows[1][0].exact_eq(&Value::Text("c2".into())));
+        assert!(rows[1][1].exact_eq(&Value::Integer(200)));
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn test_audit2_alter_add_column_fk_validates_non_null_default() {
+    let path = temp_db("audit2_alter_fk");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             INSERT INTO parents VALUES (1);
+             CREATE TABLE items (id INTEGER PRIMARY KEY);
+             INSERT INTO items VALUES (10);",
+        )
+        .unwrap();
+
+        // Non-NULL default referencing missing parent must be rejected on non-empty table.
+        assert!(
+            db.execute("ALTER TABLE items ADD COLUMN pid INTEGER DEFAULT 999 REFERENCES parents(id);")
+                .is_err(),
+            "ADD COLUMN with invalid non-NULL FK default must fail"
+        );
+        // Column must not have been added after the error.
+        assert_eq!(db.table_schema("items").unwrap().columns.len(), 1);
+
+        // Valid non-NULL default succeeds.
+        db.execute("ALTER TABLE items ADD COLUMN pid INTEGER DEFAULT 1 REFERENCES parents(id);")
+            .unwrap();
+        // NULL default succeeds without requiring a parent match.
+        db.execute("ALTER TABLE items ADD COLUMN opt_pid INTEGER REFERENCES parents(id);")
+            .unwrap();
+
+        let res = db.execute("SELECT id, pid, opt_pid FROM items;").unwrap();
+        let rows = rows_of(&res);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0][1].exact_eq(&Value::Integer(1)));
+        assert!(rows[0][2].is_null());
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn test_audit2_check_rejects_subquery_aggregate_window_and_non_finite_float() {
+    let path = temp_db("audit2_check_invalid");
+    {
+        let mut db = Database::open(&path).unwrap();
+        assert!(db
+            .execute("CREATE TABLE bad1 (x INTEGER CHECK (x IN (SELECT 1)));")
+            .is_err());
+        assert!(db
+            .execute("CREATE TABLE bad2 (x INTEGER CHECK (COUNT(*) > 0));")
+            .is_err());
+        assert!(db
+            .execute("CREATE TABLE bad3 (x INTEGER CHECK (ROW_NUMBER() OVER () > 0));")
+            .is_err());
+    }
+    assert!(squishdb::sql::format_expr(&squishdb::sql::Expr::Literal(Value::Real(f64::NAN))).is_err());
+    assert!(squishdb::sql::format_expr(&squishdb::sql::Expr::Literal(Value::Real(f64::INFINITY))).is_err());
+    cleanup(&path);
+}
+
+#[test]
+fn test_audit2_superblock_slot_fallback_and_future_generation_guard() {
+    let path = temp_db("audit2_sb_fallback");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'ok');")
+            .unwrap();
+        db.checkpoint().unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'ok2');").unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    // Read both superblocks to determine which slot has the newer valid generation.
+    let mut raw_a = [0u8; SUPERBLOCK_SIZE as usize];
+    let mut raw_b = [0u8; SUPERBLOCK_SIZE as usize];
+    {
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.read_exact(&mut raw_a).unwrap();
+        f.read_exact(&mut raw_b).unwrap();
+    }
+    let gen_a = u64::from_le_bytes(raw_a[12..20].try_into().unwrap());
+    let gen_b = u64::from_le_bytes(raw_b[12..20].try_into().unwrap());
+    let older_offset = if gen_a <= gen_b { 0u64 } else { SUPERBLOCK_SIZE };
+
+    let make_sb = |magic: &[u8; 8], version: u32, generation: u64| {
+        let mut buf = [0u8; SUPERBLOCK_SIZE as usize];
+        buf[0..8].copy_from_slice(magic);
+        buf[8..12].copy_from_slice(&version.to_le_bytes());
+        buf[12..20].copy_from_slice(&generation.to_le_bytes());
+        let crc = crc32fast::hash(&buf[0..508]);
+        buf[508..512].copy_from_slice(&crc.to_le_bytes());
+        buf
+    };
+
+    // 1. Older slot holds a CRC-valid unsupported legacy v3 superblock -> open must succeed using valid v5 slot.
+    {
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(older_offset)).unwrap();
+        f.write_all(&make_sb(b"SQSHDB03", 3, 1)).unwrap();
+    }
+    {
+        let db = Database::open_readonly(&path).unwrap();
+        assert_eq!(db.count_rows("t").unwrap(), 2);
+    }
+
+    // 2. Older slot holds a CRC-valid future v99 superblock with generation 0 -> open falls back to newer v5 slot.
+    {
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(older_offset)).unwrap();
+        f.write_all(&make_sb(b"SQSHDB99", 99, 0)).unwrap();
+    }
+    {
+        let db = Database::open_readonly(&path).unwrap();
+        assert_eq!(db.count_rows("t").unwrap(), 2);
+    }
+
+    // 3. Slot holds a CRC-valid future v99 superblock with a HIGHER generation -> must refuse silent rollback.
+    {
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(older_offset)).unwrap();
+        f.write_all(&make_sb(b"SQSHDB99", 99, 9999)).unwrap();
+    }
+    let err = Database::open_readonly(&path);
+    assert!(
+        matches!(err, Err(Error::Schema(ref m)) if m.contains("v99")),
+        "Expected future-version guard error, got {:?}",
+        err.err()
+    );
+
+    cleanup(&path);
+}
+
+#[test]
+fn test_audit2_user_savepoint_named_fk_guard_does_not_collide() {
+    let path = temp_db("audit2_sp_collision");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parents(id) ON DELETE RESTRICT);
+             INSERT INTO parents VALUES (1);
+             INSERT INTO children VALUES (10, 1);",
+        )
+        .unwrap();
+
+        db.begin().unwrap();
+        db.execute("INSERT INTO parents VALUES (2);").unwrap();
+        db.savepoint("__fk_delete_guard").unwrap();
+        db.execute("INSERT INTO parents VALUES (3);").unwrap();
+
+        // Trigger internal FK delete guard rollback on restricted parent 1.
+        assert!(db.execute("DELETE FROM parents WHERE id = 1;").is_err());
+
+        // User's savepoint named "__fk_delete_guard" must remain intact and work normally.
+        assert_eq!(db.count_rows("parents").unwrap(), 3);
+        db.rollback_to_savepoint("__fk_delete_guard").unwrap();
+        assert_eq!(db.count_rows("parents").unwrap(), 2);
+        db.release_savepoint("__fk_delete_guard").unwrap();
+        db.commit().unwrap();
+        assert_eq!(db.count_rows("parents").unwrap(), 2);
+    }
+    cleanup(&path);
+}
+
+#[test]
+fn test_audit2_sqlite_import_int_pk_vs_integer_pk_rowid_alias() {
+    let sqlite_path = temp_db("audit2_sqlite_pk").with_extension("sqlite");
+    let sqdb_path = temp_db("audit2_sqlite_pk_out");
+
+    let page_size = 4096usize;
+    let schema_cells = vec![
+        (
+            1i64,
+            build_sqlite_record(&[
+                Value::Text("table".into()),
+                Value::Text("t_alias".into()),
+                Value::Text("t_alias".into()),
+                Value::Integer(2),
+                Value::Text("CREATE TABLE t_alias (id INTEGER PRIMARY KEY, name TEXT)".into()),
+            ]),
+        ),
+        (
+            2i64,
+            build_sqlite_record(&[
+                Value::Text("table".into()),
+                Value::Text("t_int".into()),
+                Value::Text("t_int".into()),
+                Value::Integer(3),
+                Value::Text("CREATE TABLE t_int (id INT PRIMARY KEY, name TEXT)".into()),
+            ]),
+        ),
+        (
+            3i64,
+            build_sqlite_record(&[
+                Value::Text("table".into()),
+                Value::Text("t_desc".into()),
+                Value::Text("t_desc".into()),
+                Value::Integer(4),
+                Value::Text(
+                    "CREATE TABLE t_desc (id INTEGER PRIMARY KEY DESC, name TEXT COLLATE NOCASE)"
+                        .into(),
+                ),
+            ]),
+        ),
+    ];
+    let alias_cells = vec![(
+        42i64,
+        build_sqlite_record(&[Value::Null, Value::Text("aliased".into())]),
+    )];
+    let int_cells = vec![
+        (
+            99i64,
+            build_sqlite_record(&[Value::Null, Value::Text("null_int_pk".into())]),
+        ),
+        (
+            100i64,
+            build_sqlite_record(&[Value::Integer(7), Value::Text("explicit_int_pk".into())]),
+        ),
+    ];
+    let desc_cells = vec![(
+        55i64,
+        build_sqlite_record(&[Value::Null, Value::Text("desc_pk".into())]),
+    )];
+
+    let mut raw = build_sqlite_leaf_page(page_size, true, &schema_cells);
+    raw.extend_from_slice(&build_sqlite_leaf_page(page_size, false, &alias_cells));
+    raw.extend_from_slice(&build_sqlite_leaf_page(page_size, false, &int_cells));
+    raw.extend_from_slice(&build_sqlite_leaf_page(page_size, false, &desc_cells));
+    std::fs::write(&sqlite_path, &raw).unwrap();
+
+    let rep = migrate_sqlite(&sqlite_path, &sqdb_path, MigrateOptions::default()).unwrap();
+    assert_eq!(rep.tables_migrated, 3);
+    assert_eq!(rep.total_rows, 4);
+
+    let mut db = Database::open(&sqdb_path).unwrap();
+    let r_alias = db.execute("SELECT id, name FROM t_alias;").unwrap();
+    assert!(rows_of(&r_alias)[0][0].exact_eq(&Value::Integer(42)));
+
+    let r_int = db
+        .execute("SELECT id, name FROM t_int ORDER BY name ASC;")
+        .unwrap();
+    let rows_int = rows_of(&r_int);
+    assert_eq!(rows_int.len(), 2);
+    assert!(rows_int[0][0].exact_eq(&Value::Integer(7)));
+    assert!(
+        rows_int[1][0].is_null(),
+        "INT PRIMARY KEY must NOT alias rowid 99, got {:?}",
+        rows_int[1][0]
+    );
+
+    let r_desc = db.execute("SELECT id, name FROM t_desc;").unwrap();
+    assert!(
+        rows_of(&r_desc)[0][0].is_null(),
+        "INTEGER PRIMARY KEY DESC must NOT alias rowid 55, got {:?}",
+        rows_of(&r_desc)[0][0]
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(&sqlite_path);
+    cleanup(&sqdb_path);
+}

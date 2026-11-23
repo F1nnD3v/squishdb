@@ -40,18 +40,18 @@
   <!-- GROUP BY -->
   <text class="label" x="24" y="70">GROUP BY + aggregates</text>
   <text class="sub" x="24" y="85">100k rows (parallel)</text>
-  <rect class="bar-sqlite" x="205" y="57" width="337.3" height="13" rx="2" />
-  <text class="val" x="548.8" y="68">20.07 ms</text>
-  <rect class="bar-squish" x="205" y="74" width="24.9" height="13" rx="2" />
-  <text class="val-sq" x="236.4" y="85">1.48 ms (13.53x faster)</text>
+  <rect class="bar-sqlite" x="205" y="57" width="343.8" height="13" rx="2" />
+  <text class="val" x="555.3" y="68">20.46 ms</text>
+  <rect class="bar-squish" x="205" y="74" width="29.7" height="13" rx="2" />
+  <text class="val-sq" x="241.2" y="85">1.77 ms (11.56x faster)</text>
 
   <!-- UUID lookups -->
   <text class="label" x="24" y="121">200 random UUID lookups</text>
   <text class="sub" x="24" y="136">40k rows, B-tree indexed</text>
-  <rect class="bar-sqlite" x="205" y="108" width="250.5" height="13" rx="2" />
-  <text class="val" x="462.0" y="119">14.91 ms</text>
-  <rect class="bar-squish" x="205" y="125" width="244.8" height="13" rx="2" />
-  <text class="val-sq" x="456.3" y="136">14.57 ms (1.02x faster)</text>
+  <rect class="bar-sqlite" x="205" y="108" width="248.6" height="13" rx="2" />
+  <text class="val" x="460.1" y="119">14.80 ms</text>
+  <rect class="bar-squish" x="205" y="125" width="244.5" height="13" rx="2" />
+  <text class="val-sq" x="456.0" y="136">14.55 ms (1.02x faster)</text>
 
   <line class="sep" x1="24" y1="178" x2="736" y2="178" />
 
@@ -73,18 +73,18 @@
   <text class="axis" x="625" y="342" text-anchor="middle">10M</text>
 
   <text class="label" x="24" y="238">Single-row fsync</text>
-  <rect class="bar-rate" x="205" y="226" width="89.2" height="14" rx="2" />
-  <text class="val-blue" x="300.7" y="237">1,154 rows/s</text>
+  <rect class="bar-rate" x="205" y="226" width="91.9" height="14" rx="2" />
+  <text class="val-blue" x="303.4" y="237">1,241 rows/s</text>
 
   <text class="label" x="24" y="264">Single-row buffered</text>
-  <rect class="bar-rate" x="205" y="252" width="264.6" height="14" rx="2" />
-  <text class="val-blue" x="476.1" y="263">141,382 rows/s</text>
+  <rect class="bar-rate" x="205" y="252" width="268.8" height="14" rx="2" />
+  <text class="val-blue" x="480.3" y="263">158,626 rows/s</text>
 
   <text class="label" x="24" y="290">Batched 1k/tx (fsync)</text>
-  <rect class="bar-rate" x="205" y="278" width="304.0" height="14" rx="2" />
-  <text class="val-blue" x="515.5" y="289">415,983 rows/s</text>
+  <rect class="bar-rate" x="205" y="278" width="306.5" height="14" rx="2" />
+  <text class="val-blue" x="518.0" y="289">445,323 rows/s</text>
 
   <text class="label" x="24" y="316">Bulk PAX-v4 + parallel cp</text>
-  <rect class="bar-squish" x="205" y="304" width="363.9" height="14" rx="2" />
-  <text class="val-sq" x="575.4" y="315">2,150,926 rows/s</text>
+  <rect class="bar-squish" x="205" y="304" width="365.4" height="14" rx="2" />
+  <text class="val-sq" x="576.9" y="315">2,237,717 rows/s</text>
 </svg>

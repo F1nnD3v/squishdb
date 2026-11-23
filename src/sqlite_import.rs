@@ -469,6 +469,7 @@ struct ParsedSqliteTable {
     columns: Vec<ColumnDef>,
     checks: Vec<CheckConstraint>,
     foreign_keys: Vec<ForeignKeyDef>,
+    rowid_alias_col: Option<usize>,
 }
 
 struct ParsedSqliteIndex {
@@ -689,23 +690,168 @@ fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
     None
 }
 
+/// Returns the exact SQLite rowid-alias column name (if any) for a CREATE TABLE DDL.
+/// Per SQLite rules, only a single-column PRIMARY KEY whose declared type is exact `INTEGER`
+/// (case-insensitive, no length modifier, and not `DESC`) aliases the rowid.
+fn find_sqlite_rowid_alias_col(sql: &str) -> Option<String> {
+    let open = sql.find('(')?;
+    let close = find_matching_paren(sql, open)?;
+    let body = &sql[open + 1..close];
+    let items = split_top_level_commas(body);
+
+    let mut exact_integer_cols: Vec<String> = Vec::new();
+    let mut alias_candidate: Option<String> = None;
+
+    for item in items {
+        let trimmed = item.trim();
+        let up = trimmed.to_ascii_uppercase();
+        let rest = if up.starts_with("CONSTRAINT ") {
+            let after = trimmed[11..].trim();
+            let split_at = after
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(after.len());
+            after[split_at..].trim()
+        } else {
+            trimmed
+        };
+        let rest_up = rest.to_ascii_uppercase();
+
+        if rest_up.starts_with("PRIMARY KEY") {
+            if let Some(p0) = rest.find('(') {
+                if let Some(p1) = find_matching_paren(rest, p0) {
+                    let pk_items = split_top_level_commas(&rest[p0 + 1..p1]);
+                    if pk_items.len() == 1 {
+                        let pk_up = pk_items[0].to_ascii_uppercase();
+                        let pk_words: Vec<&str> = pk_up.split_whitespace().collect();
+                        let has_desc = pk_words.iter().any(|&w| w == "DESC");
+                        let col = unquote_ident(
+                            pk_items[0]
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or(pk_items[0].as_str()),
+                        );
+                        if !has_desc
+                            && exact_integer_cols
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&col))
+                        {
+                            alias_candidate = Some(col);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if rest_up.starts_with("UNIQUE")
+            || rest_up.starts_with("CHECK")
+            || rest_up.starts_with("FOREIGN KEY")
+        {
+            continue;
+        }
+
+        let (col_name, after_name) = split_first_ident(rest);
+        if col_name.is_empty() {
+            continue;
+        }
+        let mut remainder = after_name.trim();
+        let mut type_tokens = String::new();
+        let mut had_type_parens = false;
+        while !remainder.is_empty() {
+            let (tok, next_rem) = split_first_word(remainder);
+            let tok_up = tok.to_ascii_uppercase();
+            if matches!(
+                tok_up.as_str(),
+                "PRIMARY"
+                    | "NOT"
+                    | "NULL"
+                    | "UNIQUE"
+                    | "DEFAULT"
+                    | "CHECK"
+                    | "REFERENCES"
+                    | "CONSTRAINT"
+                    | "COLLATE"
+                    | "GENERATED"
+                    | "AS"
+            ) {
+                break;
+            }
+            if !type_tokens.is_empty() {
+                type_tokens.push(' ');
+            }
+            type_tokens.push_str(tok);
+            remainder = next_rem.trim();
+            if remainder.starts_with('(') {
+                had_type_parens = true;
+                if let Some(p1) = find_matching_paren(remainder, 0) {
+                    remainder = remainder[p1 + 1..].trim();
+                }
+            }
+        }
+
+        let is_exact_integer = !had_type_parens && type_tokens.eq_ignore_ascii_case("INTEGER");
+        if is_exact_integer {
+            exact_integer_cols.push(col_name.clone());
+        }
+
+        let rem_up = remainder.to_ascii_uppercase();
+        if let Some(pk_pos) = rem_up.find("PRIMARY KEY") {
+            let after_pk = rem_up[pk_pos + "PRIMARY KEY".len()..].trim();
+            let first_after = after_pk.split_whitespace().next().unwrap_or("");
+            let is_desc = first_after == "DESC";
+            if is_exact_integer && !is_desc {
+                alias_candidate = Some(col_name);
+            }
+        }
+    }
+
+    alias_candidate
+}
+
+/// Ensures only a genuine SQLite `INTEGER PRIMARY KEY` rowid alias keeps `primary_key = true`
+/// on an integer column; non-alias integer PKs (such as `INT PRIMARY KEY` or `INTEGER PRIMARY KEY DESC`)
+/// are stored as `unique = true` so SquishDB does not alias them to internal rowid or replace NULLs.
+fn reconcile_sqlite_rowid_alias(
+    columns: &mut [ColumnDef],
+    alias_name: Option<&str>,
+) -> Option<usize> {
+    let rowid_alias_col = alias_name.and_then(|an| {
+        columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(an) && c.col_type == ColumnType::Integer)
+    });
+    for (i, c) in columns.iter_mut().enumerate() {
+        if c.col_type == ColumnType::Integer && c.primary_key && Some(i) != rowid_alias_col {
+            c.primary_key = false;
+            c.unique = true;
+        }
+    }
+    if let Some(i) = rowid_alias_col {
+        columns[i].primary_key = true;
+    }
+    rowid_alias_col
+}
+
 fn parse_sqlite_create_table(table_name: &str, root_page: u32, raw_sql: &str) -> Result<ParsedSqliteTable> {
     let sql = normalize_sqlite_ident_quotes(raw_sql);
+    let alias_name = find_sqlite_rowid_alias_col(&sql);
+
     // Try SquishDB's own SQL parser first for 100% fidelity on standard DDL!
     if let Ok(stmts) = crate::sql::parse_sql(&sql) {
         if let Some(crate::sql::Statement::CreateTable {
-            columns,
+            mut columns,
             check_constraints,
             foreign_keys,
             ..
         }) = stmts.into_iter().next()
         {
+            let rowid_alias_col = reconcile_sqlite_rowid_alias(&mut columns, alias_name.as_deref());
             return Ok(ParsedSqliteTable {
                 name: table_name.to_string(),
                 root_page,
                 columns,
                 checks: check_constraints,
                 foreign_keys,
+                rowid_alias_col,
             });
         }
     }
@@ -890,12 +1036,15 @@ fn parse_sqlite_create_table(table_name: &str, root_page: u32, raw_sql: &str) ->
         )));
     }
 
+    let rowid_alias_col = reconcile_sqlite_rowid_alias(&mut columns, alias_name.as_deref());
+
     Ok(ParsedSqliteTable {
         name: table_name.to_string(),
         root_page,
         columns,
         checks,
         foreign_keys,
+        rowid_alias_col,
     })
 }
 
@@ -1205,10 +1354,7 @@ pub fn migrate_sqlite<P1: AsRef<Path>, P2: AsRef<Path>>(
             tbl.foreign_keys.clone(),
         )?;
 
-        let int_pk_col = tbl
-            .columns
-            .iter()
-            .position(|c| c.primary_key && c.col_type == ColumnType::Integer);
+        let int_pk_col = tbl.rowid_alias_col;
 
         let raw_rows = reader.read_table_btree(tbl.root_page)?;
         let num_cols = tbl.columns.len();

@@ -268,6 +268,7 @@ pub struct Database {
     pool: ParallelPool,
     foreign_keys_enabled: bool,
     active_tx: Option<TxState>,
+    next_internal_sp: u64,
     dirty: bool,
 }
 
@@ -327,6 +328,7 @@ impl Database {
             pool,
             foreign_keys_enabled: true,
             active_tx: None,
+            next_internal_sp: 0,
             dirty: false,
         };
 
@@ -366,6 +368,7 @@ impl Database {
             pool,
             foreign_keys_enabled: true,
             active_tx: None,
+            next_internal_sp: 0,
             dirty: migrated,
         };
 
@@ -425,8 +428,14 @@ impl Database {
             pool,
             foreign_keys_enabled,
             active_tx: None,
+            next_internal_sp: 0,
             dirty: false,
         })
+    }
+
+    fn alloc_internal_savepoint(&mut self, tag: &str) -> String {
+        self.next_internal_sp = self.next_internal_sp.wrapping_add(1);
+        format!("__squish_internal_{}_{}", tag, self.next_internal_sp)
     }
 
     pub(crate) fn take_tx_wal_ops(&mut self) -> Vec<WalOp> {
@@ -450,6 +459,7 @@ impl Database {
         let res: Result<Vec<WalOp>> = (|| {
             let mut applied = Vec::with_capacity(ops.len());
             let mut deleted_parent_tables: Vec<(String, Vec<Row>)> = Vec::new();
+            let mut rowid_remap: HashMap<String, HashMap<i64, i64>> = HashMap::new();
             for op in ops {
                 match op {
                     WalOp::CreateTable(schema) | WalOp::CreateTableV5(schema) => {
@@ -481,6 +491,7 @@ impl Database {
                         }
                         self.catalog.tables.remove(idx);
                         self.hot_buffers.remove(&key);
+                        rowid_remap.remove(&key);
                         self.catalog
                             .indexes
                             .retain(|ix| !ix.table_name.eq_ignore_ascii_case(&canonical));
@@ -496,13 +507,21 @@ impl Database {
                         let schema = self.catalog.tables[idx].schema.clone();
                         let pk_col = schema.integer_pk_col();
                         let mut next_rowid = schema.next_rowid;
+                        let key = schema.name.to_ascii_lowercase();
                         // For rowid-only tables (no explicit INTEGER PRIMARY KEY), re-assign
-                        // colliding internal rowids so concurrent inserts both succeed cleanly!
+                        // colliding internal rowids so concurrent inserts both succeed cleanly,
+                        // and record the remap so subsequent UPDATE/DELETE ops in the same tx
+                        // target the remapped rowid rather than another transaction's row.
                         if pk_col.is_none() {
                             for r in &mut rows {
+                                let orig_id = r.rowid;
                                 if r.rowid < next_rowid {
                                     r.rowid = next_rowid;
                                     next_rowid = next_rowid.saturating_add(1);
+                                    rowid_remap
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .insert(orig_id, r.rowid);
                                 } else {
                                     next_rowid = r.rowid.saturating_add(1);
                                 }
@@ -520,7 +539,6 @@ impl Database {
                             self.check_foreign_keys_on_write(&schema, &rows)?;
                         }
                         self.catalog.tables[idx].schema.next_rowid = next_rowid;
-                        let key = schema.name.to_ascii_lowercase();
                         self.hot_buffers
                             .entry(key)
                             .or_default()
@@ -530,11 +548,22 @@ impl Database {
                             rows,
                         });
                     }
-                    WalOp::DeleteRowIds { table_name, rowids } => {
+                    WalOp::DeleteRowIds {
+                        table_name,
+                        mut rowids,
+                    } => {
                         let idx = self.find_table_idx(&table_name).ok_or_else(|| {
                             Error::Schema(format!("No such table: '{}'", table_name))
                         })?;
                         let canonical = self.catalog.tables[idx].schema.name.clone();
+                        let key = canonical.to_ascii_lowercase();
+                        if let Some(map) = rowid_remap.get(&key) {
+                            for id in &mut rowids {
+                                if let Some(&mapped) = map.get(id) {
+                                    *id = mapped;
+                                }
+                            }
+                        }
                         let set: HashSet<i64> = rowids.iter().copied().collect();
                         let del_rows = if self.foreign_keys_enabled
                             && !self.find_referencing_fks(&canonical).is_empty()
@@ -552,11 +581,22 @@ impl Database {
                             rowids,
                         });
                     }
-                    WalOp::UpdateRows { table_name, rows } => {
+                    WalOp::UpdateRows {
+                        table_name,
+                        mut rows,
+                    } => {
                         let idx = self.find_table_idx(&table_name).ok_or_else(|| {
                             Error::Schema(format!("No such table: '{}'", table_name))
                         })?;
                         let schema = self.catalog.tables[idx].schema.clone();
+                        let key = schema.name.to_ascii_lowercase();
+                        if let Some(map) = rowid_remap.get(&key) {
+                            for r in &mut rows {
+                                if let Some(&mapped) = map.get(&r.rowid) {
+                                    r.rowid = mapped;
+                                }
+                            }
+                        }
                         let old_ids: HashSet<i64> = rows.iter().map(|r| r.rowid).collect();
                         self.check_row_constraints(&schema, &rows)?;
                         self.check_unique_constraints(
@@ -569,7 +609,6 @@ impl Database {
                             self.check_foreign_keys_on_write(&schema, &rows)?;
                         }
                         self.mark_rowids_deleted_in_memory(&schema.name, &old_ids)?;
-                        let key = schema.name.to_ascii_lowercase();
                         self.hot_buffers
                             .entry(key)
                             .or_default()
@@ -1360,18 +1399,26 @@ impl Database {
         candidate_schema.foreign_keys.extend(foreign_keys.clone());
         self.validate_table_constraints_ddl(&candidate_schema)?;
 
-        if !check_constraints.is_empty() && existing_rows > 0 {
-            // Verify backfilled rows satisfy the new CHECK constraints
-            let fill = column.default_value.clone().unwrap_or(Value::Null);
+        let fill = column.default_value.clone().unwrap_or(Value::Null);
+        let need_fk_backfill_check =
+            self.foreign_keys_enabled && !foreign_keys.is_empty() && !fill.is_null();
+        if existing_rows > 0 && (!check_constraints.is_empty() || need_fk_backfill_check) {
+            // Verify backfilled rows satisfy the new CHECK and FOREIGN KEY constraints.
             let mut rows = self.scan_all(table_name)?;
             for r in &mut rows {
                 r.values.push(fill.clone());
             }
-            self.check_row_constraints(&candidate_schema, &rows)?;
+            if !check_constraints.is_empty() {
+                self.check_row_constraints(&candidate_schema, &rows)?;
+            }
+            if need_fk_backfill_check {
+                let mut fk_only_schema = candidate_schema.clone();
+                fk_only_schema.foreign_keys = foreign_keys.clone();
+                self.check_foreign_keys_on_write(&fk_only_schema, &rows)?;
+            }
         }
 
         let canonical = self.catalog.tables[idx].schema.name.clone();
-        let fill = column.default_value.clone().unwrap_or(Value::Null);
         let key = canonical.to_ascii_lowercase();
         self.catalog.tables[idx].schema = candidate_schema;
         if let Some(hot) = self.hot_buffers.get_mut(&key) {
@@ -3593,8 +3640,10 @@ impl Database {
 
         let has_refs = self.foreign_keys_enabled && !self.find_referencing_fks(&canonical).is_empty();
         if has_refs {
-            // Use internal savepoint so any mid-cascade FK error rolls back atomically!
-            self.savepoint("__fk_delete_guard")?;
+            // Use a unique internal savepoint so any mid-cascade FK error rolls back atomically
+            // without colliding with user savepoint names.
+            let sp_name = self.alloc_internal_savepoint("fk_del");
+            self.savepoint(&sp_name)?;
             let res: Result<usize> = (|| {
                 let mut visited: HashSet<(String, i64)> = matched
                     .iter()
@@ -3612,12 +3661,12 @@ impl Database {
             })();
             match res {
                 Ok(count) => {
-                    self.release_savepoint("__fk_delete_guard")?;
+                    self.release_savepoint(&sp_name)?;
                     return Ok(count);
                 }
                 Err(e) => {
-                    let _ = self.rollback_to_savepoint("__fk_delete_guard");
-                    let _ = self.release_savepoint("__fk_delete_guard");
+                    let _ = self.rollback_to_savepoint(&sp_name);
+                    let _ = self.release_savepoint(&sp_name);
                     return Err(e);
                 }
             }
@@ -3705,7 +3754,8 @@ impl Database {
 
         let has_refs = self.foreign_keys_enabled && !self.find_referencing_fks(&canonical).is_empty();
         if has_refs {
-            self.savepoint("__fk_update_guard")?;
+            let sp_name = self.alloc_internal_savepoint("fk_upd");
+            self.savepoint(&sp_name)?;
             let res: Result<usize> = (|| {
                 let count = updated_rows.len();
                 self.catalog.tables[idx].schema.next_rowid = next_rowid;
@@ -3736,12 +3786,12 @@ impl Database {
             })();
             match res {
                 Ok(count) => {
-                    self.release_savepoint("__fk_update_guard")?;
+                    self.release_savepoint(&sp_name)?;
                     return Ok(count);
                 }
                 Err(e) => {
-                    let _ = self.rollback_to_savepoint("__fk_update_guard");
-                    let _ = self.release_savepoint("__fk_update_guard");
+                    let _ = self.rollback_to_savepoint(&sp_name);
+                    let _ = self.release_savepoint(&sp_name);
                     return Err(e);
                 }
             }

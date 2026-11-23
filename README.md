@@ -161,8 +161,8 @@ Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the s
 
 | Benchmark | SQLite C | Parquet (Zstd L9) | SquishDB v0.5 | Comparison |
 |---|---:|---:|---:|---:|
-| GROUP BY + SUM/AVG/COUNT (100k rows) | 20.07 ms, 9.21 MB | n/a | 1.48 ms, 1.29 MB | 13.53x faster, 7.14x smaller |
-| 200 random UUID lookups (40k rows, B-tree) | 14.91 ms, 4.64 MB | n/a | 14.57 ms, 2.39 MB | 1.02x faster, 1.94x smaller |
+| GROUP BY + SUM/AVG/COUNT (100k rows) | 20.46 ms, 9.21 MB | n/a | 1.77 ms, 1.29 MB | 11.56x faster, 7.14x smaller |
+| 200 random UUID lookups (40k rows, B-tree) | 14.80 ms, 4.64 MB | n/a | 14.55 ms, 2.39 MB | 1.02x faster, 1.94x smaller |
 | UUID B-tree index disk overhead (40k rows) | +1,752 KB | n/a | +888 KB | 1.97x smaller B-tree index |
 | Multi-device IoT clustered (150k rows) | 7.82 MB | 1.50 MB | 0.40 MB | 19.45x smaller than SQLite, 3.75x smaller than Parquet |
 | JSON telemetry logs (80k rows) | 14.81 MB | 1.47 MB | 1.05 MB | 14.10x smaller than SQLite |
@@ -172,10 +172,10 @@ Measured against vacuumed SQLite C and Apache Parquet with Zstd level 9 on the s
 
 Measured in release mode:
 
-- Single-row auto-commit with `sync_wal = true` (fsync per row): 1,154 rows/sec.
-- Single-row auto-commit with `sync_wal = false` (buffered WAL): 141,382 rows/sec.
-- Batched WAL transaction at 1,000 rows per `COMMIT` with `sync_wal = true`: 415,983 rows/sec.
-- Direct bulk PAX-v4 load plus parallel Brotli checkpoint over 50,000 rows: 2,150,926 rows/sec.
+- Single-row auto-commit with `sync_wal = true` (fsync per row): 1,241 rows/sec.
+- Single-row auto-commit with `sync_wal = false` (buffered WAL): 158,626 rows/sec.
+- Batched WAL transaction at 1,000 rows per `COMMIT` with `sync_wal = true`: 445,323 rows/sec.
+- Direct bulk PAX-v4 load plus parallel Brotli checkpoint over 50,000 rows: 2,237,717 rows/sec.
 
 Single-row fsynced writes are bound by disk fsync latency, so wrap bulk writes in `BEGIN` / `COMMIT` or call `insert_batch` or `bulk_insert`.
 

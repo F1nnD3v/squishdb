@@ -60,17 +60,23 @@ impl WriteSet {
                 WalOp::DeleteRowIds { table_name, rowids } => {
                     let k = table_name.to_ascii_lowercase();
                     ws.touched_tables.insert(k.clone());
+                    let inserted = ws.inserted_rowids.get(&k);
                     let set = ws.modified_rowids.entry(k).or_default();
                     for &id in rowids {
-                        set.insert(id);
+                        if !inserted.map_or(false, |ins| ins.contains(&id)) {
+                            set.insert(id);
+                        }
                     }
                 }
                 WalOp::UpdateRows { table_name, rows } => {
                     let k = table_name.to_ascii_lowercase();
                     ws.touched_tables.insert(k.clone());
+                    let inserted = ws.inserted_rowids.get(&k);
                     let set = ws.modified_rowids.entry(k).or_default();
                     for r in rows {
-                        set.insert(r.rowid);
+                        if !inserted.map_or(false, |ins| ins.contains(&r.rowid)) {
+                            set.insert(r.rowid);
+                        }
                     }
                 }
             }

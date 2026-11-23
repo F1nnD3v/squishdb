@@ -783,7 +783,7 @@ impl<'a> Parser<'a> {
                 self.expect_tok(Token::RParen)?;
                 checks_out.push(CheckConstraint {
                     name: constraint_name,
-                    expr_sql: format_expr(&expr),
+                    expr_sql: format_expr(&expr)?,
                 });
             } else if self.eat_kw("REFERENCES") {
                 let fk = self.parse_fk_references(constraint_name, vec![col_name.clone()])?;
@@ -949,7 +949,7 @@ impl<'a> Parser<'a> {
                         self.expect_tok(Token::RParen)?;
                         check_constraints.push(CheckConstraint {
                             name: cname,
-                            expr_sql: format_expr(&expr),
+                            expr_sql: format_expr(&expr)?,
                         });
                     } else if self.eat_kw("FOREIGN") {
                         self.expect_kw("KEY")?;
@@ -1859,42 +1859,49 @@ pub fn parse_expr_str(sql: &str) -> Result<Expr> {
 }
 
 /// Formats an `Expr` AST back into canonical SQL text (for persisting CHECK constraints).
-pub fn format_expr(expr: &Expr) -> String {
+/// Rejects subqueries, aggregates, and window expressions that are invalid inside CHECK.
+pub fn format_expr(expr: &Expr) -> Result<String> {
     fn quote_ident(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\"\""))
     }
-    fn fmt_val(v: &Value) -> String {
+    fn fmt_val(v: &Value) -> Result<String> {
         match v {
-            Value::Null => "NULL".into(),
-            Value::Integer(i) => i.to_string(),
+            Value::Null => Ok("NULL".into()),
+            Value::Integer(i) => Ok(i.to_string()),
             Value::Real(f) => {
+                if !f.is_finite() {
+                    return Err(Error::Sql(format!(
+                        "Non-finite floating-point value ({}) is not valid in SQL expressions",
+                        f
+                    )));
+                }
                 let s = f.to_string();
                 if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                    format!("{}.0", s)
+                    Ok(format!("{}.0", s))
                 } else {
-                    s
+                    Ok(s)
                 }
             }
-            Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Text(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
             Value::Blob(b) => {
                 let mut out = String::from("X'");
                 for byte in b {
                     out.push_str(&format!("{:02X}", byte));
                 }
                 out.push('\'');
-                out
+                Ok(out)
             }
         }
     }
     match expr {
         Expr::Literal(v) => fmt_val(v),
-        Expr::Column { table: None, name } => quote_ident(name),
+        Expr::Column { table: None, name } => Ok(quote_ident(name)),
         Expr::Column {
             table: Some(t),
             name,
-        } => format!("{}.{}", quote_ident(t), quote_ident(name)),
-        Expr::UnaryNot(e) => format!("(NOT {})", format_expr(e)),
-        Expr::UnaryNeg(e) => format!("(-{})", format_expr(e)),
+        } => Ok(format!("{}.{}", quote_ident(t), quote_ident(name))),
+        Expr::UnaryNot(e) => Ok(format!("(NOT {})", format_expr(e)?)),
+        Expr::UnaryNeg(e) => Ok(format!("(-{})", format_expr(e)?)),
         Expr::Binary { left, op, right } => {
             let op_s = match op {
                 BinOp::Eq => "=",
@@ -1911,13 +1918,18 @@ pub fn format_expr(expr: &Expr) -> String {
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
             };
-            format!("({} {} {})", format_expr(left), op_s, format_expr(right))
+            Ok(format!(
+                "({} {} {})",
+                format_expr(left)?,
+                op_s,
+                format_expr(right)?
+            ))
         }
         Expr::IsNull { expr, negated } => {
             if *negated {
-                format!("({} IS NOT NULL)", format_expr(expr))
+                Ok(format!("({} IS NOT NULL)", format_expr(expr)?))
             } else {
-                format!("({} IS NULL)", format_expr(expr))
+                Ok(format!("({} IS NULL)", format_expr(expr)?))
             }
         }
         Expr::Between {
@@ -1927,13 +1939,13 @@ pub fn format_expr(expr: &Expr) -> String {
             negated,
         } => {
             let kw = if *negated { "NOT BETWEEN" } else { "BETWEEN" };
-            format!(
+            Ok(format!(
                 "({} {} {} AND {})",
-                format_expr(expr),
+                format_expr(expr)?,
                 kw,
-                format_expr(low),
-                format_expr(high)
-            )
+                format_expr(low)?,
+                format_expr(high)?
+            ))
         }
         Expr::InList {
             expr,
@@ -1941,21 +1953,37 @@ pub fn format_expr(expr: &Expr) -> String {
             negated,
         } => {
             let kw = if *negated { "NOT IN" } else { "IN" };
-            let items: Vec<String> = list.iter().map(format_expr).collect();
-            format!("({} {} ({}))", format_expr(expr), kw, items.join(", "))
+            let mut items = Vec::with_capacity(list.len());
+            for item in list {
+                items.push(format_expr(item)?);
+            }
+            Ok(format!(
+                "({} {} ({}))",
+                format_expr(expr)?,
+                kw,
+                items.join(", ")
+            ))
         }
         Expr::Case { whens, else_expr } => {
             let mut s = String::from("(CASE");
             for (c, v) in whens {
-                s.push_str(&format!(" WHEN {} THEN {}", format_expr(c), format_expr(v)));
+                s.push_str(&format!(" WHEN {} THEN {}", format_expr(c)?, format_expr(v)?));
             }
             if let Some(e) = else_expr {
-                s.push_str(&format!(" ELSE {}", format_expr(e)));
+                s.push_str(&format!(" ELSE {}", format_expr(e)?));
             }
             s.push_str(" END)");
-            s
+            Ok(s)
         }
-        _ => "1".into(),
+        Expr::InSubquery { .. } => Err(Error::Sql(
+            "Subqueries are not allowed in CHECK constraints".into(),
+        )),
+        Expr::Aggregate(_) => Err(Error::Sql(
+            "Aggregate functions are not allowed in CHECK constraints".into(),
+        )),
+        Expr::Window { .. } => Err(Error::Sql(
+            "Window functions are not allowed in CHECK constraints".into(),
+        )),
     }
 }
 
