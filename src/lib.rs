@@ -349,7 +349,10 @@ impl Database {
         let lock = OsFileLock::try_acquire(&path_buf, true)?;
         let (storage, catalog) = StorageFile::open(&path_buf)?;
         let mut wal = WalFile::open(&path_buf)?;
-        let frames = wal.read_frames(storage.superblock.generation)?;
+        let (frames, wal_offset) = wal.read_frames_from(storage.superblock.generation, 0)?;
+        if wal.file_len() > wal_offset {
+            wal.truncate_to(wal_offset)?;
+        }
         let cache_cap = options.cache_pages;
         let idx_cap = options.index_cache_blocks;
         let pool = ParallelPool::new(options.parallel_workers);
@@ -4373,7 +4376,8 @@ impl Database {
         };
         let _ = std::fs::remove_file(&tmp_path);
 
-        let (mut new_storage, mut new_catalog) = StorageFile::open(&tmp_path)?;
+        let mut new_storage = StorageFile::create_temp_for_vacuum(&tmp_path)?;
+        let mut new_catalog = Catalog::default();
         new_storage.superblock.next_table_id = self.storage.superblock.next_table_id;
 
         let page_rows = self.options.page_rows;
@@ -4480,18 +4484,20 @@ impl Database {
         }
         new_catalog.indexes = new_indexes;
 
+        // Keep generation strictly monotonic across VACUUM so stale pre-vacuum WAL frames
+        // are ignored even if power fails between atomic file replacement and WAL truncation.
+        new_storage.superblock.generation = self.storage.superblock.generation;
         new_storage.commit_catalog(&new_catalog, profile)?;
+        new_storage.mirror_superblock_both_slots()?;
         drop(new_storage);
 
-        let (tmp_storage, _) = StorageFile::open(&tmp_path)?;
-        let old_storage = std::mem::replace(&mut self.storage, tmp_storage);
-        drop(old_storage);
-
-        std::fs::copy(&tmp_path, &self.path)?;
-        let (final_storage, final_catalog) = StorageFile::open(&self.path)?;
-        let tmp_handle = std::mem::replace(&mut self.storage, final_storage);
-        drop(tmp_handle);
-        let _ = std::fs::remove_file(&tmp_path);
+        let final_catalog = match self.storage.replace_from_temp(&tmp_path) {
+            Ok(cat) => cat,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        };
 
         self.catalog = final_catalog;
         self.hot_buffers.clear();

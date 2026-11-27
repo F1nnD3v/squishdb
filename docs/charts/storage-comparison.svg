@@ -72,8 +72,8 @@
   <text class="sub" x="24" y="283">40k rows + B-tree</text>
   <rect class="bar-sqlite" x="195" y="256" width="123.9" height="12" rx="2" />
   <text class="val" x="325.4" y="266">4.64 MB</text>
-  <rect class="bar-squish" x="195" y="272" width="63.8" height="12" rx="2" />
-  <text class="val-sq" x="265.3" y="282">2.39 MB (1.9x smaller)</text>
+  <rect class="bar-squish" x="195" y="272" width="65.4" height="12" rx="2" />
+  <text class="val-sq" x="266.9" y="282">2.45 MB (1.9x smaller)</text>
 
   <!-- Row 5: Random 4 KB blobs (entropy limit) -->
   <text class="label" x="24" y="325">Random 4 KB blobs</text>
@@ -83,5 +83,5 @@
   <rect class="bar-parquet" x="195" y="324" width="209.3" height="11" rx="2" />
   <text class="val" x="410.8" y="333">7.85 MB</text>
   <rect class="bar-squish" x="195" y="338" width="208.4" height="11" rx="2" />
-  <text class="val-sq" x="409.9" y="347">7.81 MB (+0.57 B/row)</text>
+  <text class="val-sq" x="409.9" y="347">7.81 MB (+0.58 B/row)</text>
 </svg>

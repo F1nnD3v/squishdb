@@ -98,6 +98,27 @@ impl Superblock {
         }
     }
 
+    fn inspect_slot_in_bounds(
+        buf: &[u8; SUPERBLOCK_SIZE as usize],
+        file_len: u64,
+    ) -> SuperblockSlot {
+        match Self::inspect_slot(buf) {
+            SuperblockSlot::Valid(sb) => {
+                let in_bounds = sb.catalog_stored_len == 0
+                    || sb
+                        .catalog_offset
+                        .checked_add(sb.catalog_stored_len as u64)
+                        .map_or(false, |end| end <= file_len);
+                if in_bounds {
+                    SuperblockSlot::Valid(sb)
+                } else {
+                    SuperblockSlot::Invalid
+                }
+            }
+            other => other,
+        }
+    }
+
     pub fn empty() -> Self {
         Superblock {
             version: FORMAT_VERSION,
@@ -676,7 +697,7 @@ impl Catalog {
 }
 
 pub struct StorageFile {
-    file: File,
+    file: Option<File>,
     pub path: PathBuf,
     pub superblock: Superblock,
     active_slot: u8,
@@ -797,6 +818,18 @@ pub fn read_pax_batch_from_file(
 }
 
 impl StorageFile {
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("StorageFile handle must be open")
+    }
+
+    fn file_ref(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("StorageFile handle must be open")
+    }
+
     pub fn open(path: &Path) -> Result<(Self, Catalog)> {
         Self::open_mode(path, false)
     }
@@ -805,19 +838,60 @@ impl StorageFile {
         Self::open_mode(path, true)
     }
 
+    /// Creates a fresh truncated temp file for `VACUUM` starting cleanly at `DATA_START_OFFSET`
+    /// without writing an empty placeholder catalog.
+    pub fn create_temp_for_vacuum(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(StorageFile {
+            file: Some(file),
+            path: path.to_path_buf(),
+            superblock: Superblock::empty(),
+            active_slot: 0,
+            read_only: false,
+            migrated_from_version: None,
+        })
+    }
+
+    /// Mirrors the current superblock into both A/B slots (used at the end of `VACUUM` so both
+    /// slots hold the compacted generation immediately).
+    pub fn mirror_superblock_both_slots(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::Sql("Database is opened read-only".into()));
+        }
+        let sb_bytes = self.superblock.serialize();
+        self.file_mut().seek(SeekFrom::Start(0))?;
+        self.file_mut().write_all(&sb_bytes)?;
+        self.file_mut().seek(SeekFrom::Start(SUPERBLOCK_SIZE))?;
+        self.file_mut().write_all(&sb_bytes)?;
+        self.file_mut().sync_all()?;
+        self.active_slot = 0;
+        Ok(())
+    }
+
     /// Reads only the two 512-byte A/B superblocks to check the latest committed generation on disk.
     pub fn read_latest_generation(path: &Path) -> Result<u64> {
         let mut f = OpenOptions::new().read(true).open(path)?;
         let len = f.metadata()?.len();
-        if len < DATA_START_OFFSET {
+        if len == 0 {
             return Ok(0);
+        }
+        if len < DATA_START_OFFSET {
+            return Err(Error::Corruption(format!(
+                "Database file is truncated ({} bytes, minimum header is {} bytes)",
+                len, DATA_START_OFFSET
+            )));
         }
         let mut buf_a = [0u8; SUPERBLOCK_SIZE as usize];
         let mut buf_b = [0u8; SUPERBLOCK_SIZE as usize];
         f.read_exact(&mut buf_a)?;
         f.read_exact(&mut buf_b)?;
-        let slot_a = Superblock::inspect_slot(&buf_a);
-        let slot_b = Superblock::inspect_slot(&buf_b);
+        let slot_a = Superblock::inspect_slot_in_bounds(&buf_a, len);
+        let slot_b = Superblock::inspect_slot_in_bounds(&buf_b, len);
         match (slot_a, slot_b) {
             (SuperblockSlot::Valid(a), SuperblockSlot::Valid(b)) => {
                 Ok(a.generation.max(b.generation))
@@ -844,14 +918,14 @@ impl StorageFile {
         };
 
         let file_len = file.metadata()?.len();
-        if file_len < DATA_START_OFFSET {
+        if file_len == 0 {
             if read_only {
                 return Err(Error::Corruption(
                     "Database file is empty or too small to open read-only".into(),
                 ));
             }
             let mut sf = StorageFile {
-                file,
+                file: Some(file),
                 path: path.to_path_buf(),
                 superblock: Superblock::empty(),
                 active_slot: 0,
@@ -862,9 +936,15 @@ impl StorageFile {
             sf.commit_catalog(&cat, CompressionProfile::Balanced)?;
             return Ok((sf, cat));
         }
+        if file_len < DATA_START_OFFSET {
+            return Err(Error::Corruption(format!(
+                "Database file is truncated or corrupted ({} bytes, minimum header is {} bytes)",
+                file_len, DATA_START_OFFSET
+            )));
+        }
 
         let mut sf = StorageFile {
-            file,
+            file: Some(file),
             path: path.to_path_buf(),
             superblock: Superblock::empty(),
             active_slot: 0,
@@ -874,12 +954,12 @@ impl StorageFile {
 
         let mut buf_a = [0u8; SUPERBLOCK_SIZE as usize];
         let mut buf_b = [0u8; SUPERBLOCK_SIZE as usize];
-        sf.file.seek(SeekFrom::Start(0))?;
-        sf.file.read_exact(&mut buf_a)?;
-        sf.file.read_exact(&mut buf_b)?;
+        sf.file_mut().seek(SeekFrom::Start(0))?;
+        sf.file_mut().read_exact(&mut buf_a)?;
+        sf.file_mut().read_exact(&mut buf_b)?;
 
-        let slot_a = Superblock::inspect_slot(&buf_a);
-        let slot_b = Superblock::inspect_slot(&buf_b);
+        let slot_a = Superblock::inspect_slot_in_bounds(&buf_a, file_len);
+        let slot_b = Superblock::inspect_slot_in_bounds(&buf_b, file_len);
 
         let (sb, slot) = match (slot_a, slot_b) {
             (SuperblockSlot::Valid(a), SuperblockSlot::Valid(b)) => {
@@ -944,10 +1024,10 @@ impl StorageFile {
     }
 
     fn read_catalog_versioned(&mut self, format_version: u32) -> Result<Catalog> {
-        let sb = &self.superblock;
-        self.file.seek(SeekFrom::Start(sb.catalog_offset))?;
+        let sb = self.superblock.clone();
+        self.file_mut().seek(SeekFrom::Start(sb.catalog_offset))?;
         let mut stored = vec![0u8; sb.catalog_stored_len as usize];
-        self.file.read_exact(&mut stored)?;
+        self.file_mut().read_exact(&mut stored)?;
         let actual_crc = crc32fast::hash(&stored);
         if actual_crc != sb.catalog_crc32 {
             return Err(Error::Corruption(format!(
@@ -964,8 +1044,8 @@ impl StorageFile {
             return Err(Error::Sql("Database is opened read-only".into()));
         }
         let offset = self.superblock.data_end_offset.max(DATA_START_OFFSET);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&encoded.stored_bytes)?;
+        self.file_mut().seek(SeekFrom::Start(offset))?;
+        self.file_mut().write_all(&encoded.stored_bytes)?;
 
         let page_id = self.superblock.next_page_id;
         self.superblock.next_page_id += 1;
@@ -1007,11 +1087,11 @@ impl StorageFile {
         meta: &PageMeta,
         needed_cols: Option<&[bool]>,
     ) -> Result<Vec<Row>> {
-        read_pax_page_from_file(&mut self.file, schema, meta, needed_cols)
+        read_pax_page_from_file(self.file_mut(), schema, meta, needed_cols)
     }
 
     pub fn read_pax_header(&mut self, meta: &PageMeta) -> Result<(u64, PaxHeader)> {
-        read_pax_header_from_file(&mut self.file, meta)
+        read_pax_header_from_file(self.file_mut(), meta)
     }
 
     pub fn read_pax_column(
@@ -1025,10 +1105,10 @@ impl StorageFile {
 
         if col_idx.is_none() || col_idx == int_pk_col {
             let rc = &header.rowids_chunk;
-            self.file
+            self.file_mut()
                 .seek(SeekFrom::Start(data_base + rc.rel_offset as u64))?;
             let mut buf = vec![0u8; rc.stored_len as usize];
-            self.file.read_exact(&mut buf)?;
+            self.file_mut().read_exact(&mut buf)?;
             let rowids = decode_rowids_chunk(&buf, rc, header.row_count)?;
             return Ok(ColumnVector::Int64 {
                 data: rowids,
@@ -1046,10 +1126,10 @@ impl StorageFile {
             ));
         }
         let cm = &header.col_chunks[ci];
-        self.file
+        self.file_mut()
             .seek(SeekFrom::Start(data_base + cm.rel_offset as u64))?;
         let mut buf = vec![0u8; cm.stored_len as usize];
-        self.file.read_exact(&mut buf)?;
+        self.file_mut().read_exact(&mut buf)?;
         decode_column_chunk_vector(col_def.col_type, &buf, cm, header.row_count)
     }
 
@@ -1060,7 +1140,7 @@ impl StorageFile {
         needed_cols: &[bool],
         need_rowids: bool,
     ) -> Result<ColumnBatch> {
-        read_pax_batch_from_file(&mut self.file, schema, meta, needed_cols, need_rowids)
+        read_pax_batch_from_file(self.file_mut(), schema, meta, needed_cols, need_rowids)
     }
 
     /// Appends a sorted, compressed on-disk hash index leaf block.
@@ -1076,8 +1156,8 @@ impl StorageFile {
         let max_hash = entries.last().map(|e| e.0).unwrap_or(0);
         let (stored, raw_len, compression, crc32) = encode_index_block(entries, profile)?;
         let offset = self.superblock.data_end_offset.max(DATA_START_OFFSET);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&stored)?;
+        self.file_mut().seek(SeekFrom::Start(offset))?;
+        self.file_mut().write_all(&stored)?;
         let stored_len = stored.len() as u32;
         self.superblock.data_end_offset = offset + stored_len as u64;
 
@@ -1094,9 +1174,9 @@ impl StorageFile {
     }
 
     pub fn read_index_block(&mut self, meta: &IndexBlockMeta) -> Result<Vec<(u64, u64, u32)>> {
-        self.file.seek(SeekFrom::Start(meta.offset))?;
+        self.file_mut().seek(SeekFrom::Start(meta.offset))?;
         let mut stored = vec![0u8; meta.stored_len as usize];
-        self.file.read_exact(&mut stored)?;
+        self.file_mut().read_exact(&mut stored)?;
         decode_index_block(&stored, meta.compression, meta.raw_len, meta.crc32)
     }
 
@@ -1121,8 +1201,8 @@ impl StorageFile {
         let (stored, raw_len, compression, crc32) =
             encode_btree_block(entries, key_cols, profile)?;
         let offset = self.superblock.data_end_offset.max(DATA_START_OFFSET);
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&stored)?;
+        self.file_mut().seek(SeekFrom::Start(offset))?;
+        self.file_mut().write_all(&stored)?;
         let stored_len = stored.len() as u32;
         self.superblock.data_end_offset = offset + stored_len as u64;
 
@@ -1139,9 +1219,9 @@ impl StorageFile {
     }
 
     pub fn read_btree_index_block(&mut self, meta: &BTreeBlockMeta) -> Result<Vec<BTreeLeafEntry>> {
-        self.file.seek(SeekFrom::Start(meta.offset))?;
+        self.file_mut().seek(SeekFrom::Start(meta.offset))?;
         let mut stored = vec![0u8; meta.stored_len as usize];
-        self.file.read_exact(&mut stored)?;
+        self.file_mut().read_exact(&mut stored)?;
         decode_btree_block(&stored, meta.compression, meta.raw_len, meta.crc32)
     }
 
@@ -1159,11 +1239,11 @@ impl StorageFile {
         let crc = crc32fast::hash(&stored_cat);
 
         let cat_offset = self.superblock.data_end_offset.max(DATA_START_OFFSET);
-        self.file.seek(SeekFrom::Start(cat_offset))?;
-        self.file.write_all(&stored_cat)?;
+        self.file_mut().seek(SeekFrom::Start(cat_offset))?;
+        self.file_mut().write_all(&stored_cat)?;
         let new_end = cat_offset + stored_cat.len() as u64;
-        self.file.set_len(new_end)?;
-        self.file.sync_data()?;
+        self.file_mut().set_len(new_end)?;
+        self.file_mut().sync_data()?;
 
         self.superblock.version = FORMAT_VERSION_V4;
         self.superblock.generation += 1;
@@ -1172,13 +1252,14 @@ impl StorageFile {
         self.superblock.catalog_raw_len = raw_cat.len() as u32;
         self.superblock.catalog_algo = algo;
         self.superblock.catalog_crc32 = crc;
+        self.superblock.data_end_offset = new_end;
 
         let sb_bytes = self.superblock.serialize();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&sb_bytes)?;
-        self.file.seek(SeekFrom::Start(SUPERBLOCK_SIZE))?;
-        self.file.write_all(&sb_bytes)?;
-        self.file.sync_data()?;
+        self.file_mut().seek(SeekFrom::Start(0))?;
+        self.file_mut().write_all(&sb_bytes)?;
+        self.file_mut().seek(SeekFrom::Start(SUPERBLOCK_SIZE))?;
+        self.file_mut().write_all(&sb_bytes)?;
+        self.file_mut().sync_data()?;
         self.active_slot = 0;
         Ok(())
     }
@@ -1196,11 +1277,11 @@ impl StorageFile {
         let crc = crc32fast::hash(&stored_cat);
 
         let cat_offset = self.superblock.data_end_offset.max(DATA_START_OFFSET);
-        self.file.seek(SeekFrom::Start(cat_offset))?;
-        self.file.write_all(&stored_cat)?;
+        self.file_mut().seek(SeekFrom::Start(cat_offset))?;
+        self.file_mut().write_all(&stored_cat)?;
         let new_end = cat_offset + stored_cat.len() as u64;
-        self.file.set_len(new_end)?;
-        self.file.sync_data()?;
+        self.file_mut().set_len(new_end)?;
+        self.file_mut().sync_data()?;
 
         self.superblock.version = FORMAT_VERSION;
         self.superblock.generation += 1;
@@ -1209,19 +1290,67 @@ impl StorageFile {
         self.superblock.catalog_raw_len = raw_cat.len() as u32;
         self.superblock.catalog_algo = algo;
         self.superblock.catalog_crc32 = crc;
+        // Advance data_end_offset past this catalog so the next checkpoint never overwrites
+        // the previous valid superblock's catalog before the new superblock is durable.
+        self.superblock.data_end_offset = new_end;
 
         let next_slot = if self.active_slot == 0 { 1 } else { 0 };
         let sb_bytes = self.superblock.serialize();
-        self.file
+        self.file_mut()
             .seek(SeekFrom::Start((next_slot as u64) * SUPERBLOCK_SIZE))?;
-        self.file.write_all(&sb_bytes)?;
-        self.file.sync_data()?;
+        self.file_mut().write_all(&sb_bytes)?;
+        self.file_mut().sync_data()?;
         self.active_slot = next_slot;
         self.migrated_from_version = None;
         Ok(())
     }
 
+    pub fn sync_all(&self) -> Result<()> {
+        self.file_ref().sync_all()?;
+        Ok(())
+    }
+
+    /// Closes this file handle, atomically replaces `self.path` with `tmp_path`,
+    /// and reopens the compacted database file.
+    pub fn replace_from_temp(&mut self, tmp_path: &Path) -> Result<Catalog> {
+        if self.read_only {
+            return Err(Error::Sql("Database is opened read-only".into()));
+        }
+        // Release the handle to `self.path` before atomic rename/MoveFileExW (required on Windows).
+        let _ = self.file.take();
+        if let Err(e) = crate::lock::atomic_replace_file(tmp_path, &self.path) {
+            #[cfg(windows)]
+            let fallback_ok = if matches!(e.raw_os_error(), Some(5) | Some(32)) {
+                // shortcut: Windows MoveFileExW fails with ACCESS_DENIED/SHARING_VIOLATION when
+                // a peer cross-process SharedDatabase holds an idle handle to `self.path`;
+                // upgrade when SharedDatabase closes idle handles across processes.
+                std::fs::copy(tmp_path, &self.path)
+                    .and_then(|_| {
+                        let f = OpenOptions::new().read(true).write(true).open(&self.path)?;
+                        f.sync_all()?;
+                        let _ = std::fs::remove_file(tmp_path);
+                        Ok(())
+                    })
+                    .is_ok()
+            } else {
+                false
+            };
+            #[cfg(not(windows))]
+            let fallback_ok = false;
+
+            if !fallback_ok {
+                if let Ok(reopened) = OpenOptions::new().read(true).write(true).open(&self.path) {
+                    self.file = Some(reopened);
+                }
+                return Err(Error::Io(e));
+            }
+        }
+        let (reopened, catalog) = Self::open(&self.path)?;
+        *self = reopened;
+        Ok(catalog)
+    }
+
     pub fn file_len(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.file_ref().metadata()?.len())
     }
 }

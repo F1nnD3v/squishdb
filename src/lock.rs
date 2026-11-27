@@ -277,6 +277,12 @@ pub fn atomic_replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(windows))]
     {
-        std::fs::rename(src, dst)
+        std::fs::rename(src, dst)?;
+        let parent = dst.parent().filter(|p| !p.as_os_str().is_empty());
+        let dir_path = parent.unwrap_or_else(|| Path::new("."));
+        if let Ok(dir) = File::open(dir_path) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 }

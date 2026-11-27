@@ -492,7 +492,10 @@ impl WalFile {
                 break;
             }
             let payload = &raw[payload_start..payload_end];
-            if crc32fast::hash(payload) != expected_crc {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&raw[pos..pos + 16]);
+            hasher.update(payload);
+            if hasher.finalize() != expected_crc {
                 break;
             }
             pos = payload_end;
@@ -525,12 +528,14 @@ impl WalFile {
         for op in ops {
             op.write_binary(&mut payload);
         }
-        let crc = crc32fast::hash(&payload);
-
         let mut header = [0u8; 20];
         header[0..4].copy_from_slice(WAL_MAGIC);
         header[4..12].copy_from_slice(&base_generation.to_le_bytes());
         header[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header[0..16]);
+        hasher.update(&payload);
+        let crc = hasher.finalize();
         header[16..20].copy_from_slice(&crc.to_le_bytes());
 
         let f = self.file.as_mut().unwrap();

@@ -44,6 +44,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Set up Python (cross-platform bindings)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js (cross-platform bindings)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test Python bindings (${{ matrix.os }})
+        shell: bash
+        run: PYTHONPATH=bindings/python python -m unittest discover -s bindings/python/tests -v
+
+      - name: Test TypeScript / Node.js bindings (${{ matrix.os }})
+        shell: bash
+        run: node --test bindings/typescript/test/squishdb.test.mjs
+
   sqlite-benchmark-smoke:
     name: SQLite Lossless Verification (Linux)
     runs-on: ubuntu-latest

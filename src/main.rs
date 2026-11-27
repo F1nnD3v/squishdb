@@ -281,7 +281,7 @@ fn run_import_bin(
 }
 
 fn run_export_bin(db_path: &Path, table_name: &str) -> Result<()> {
-    let mut db = Database::open(db_path)?;
+    let mut db = Database::open_readonly(db_path)?;
     let rows = db.scan_all(table_name)?;
 
     let stdout = io::stdout();

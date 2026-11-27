@@ -27,17 +27,17 @@ Set `SQUISHDB_LIB_PATH` (for FFI bindings) or `SQUISHDB_BIN` (for RPC bindings) 
 
 ## Language matrix
 
-| Language | Binding Path | Mechanism | External Dependencies |
-|---|---|---|---|
-| **Python** | `bindings/python/` | In-process C FFI (`ctypes`) + PEP 249 DB-API 2.0 | None (stdlib only) |
-| **TypeScript / JavaScript** (Node.js, Bun, Deno) | `bindings/typescript/` | Persistent `squishdb rpc` over stdio | None (Node >= 18) |
-| **Java / Kotlin (JVM)** | `bindings/java/` | In-process Java 22+ Foreign Function & Memory API | None (JDK 22+) |
-| **C# / .NET** | `bindings/csharp/` | In-process P/Invoke (`DllImport`) | None (.NET 8+) |
-| **Go** | `bindings/go/` | In-process `cgo` against `include/squishdb.h` | None (stdlib + cgo) |
-| **C** | `include/squishdb.h` | Direct C99 header + shared/static lib | None |
-| **C++17** | `include/squishdb.hpp` | Header-only RAII wrapper over `squishdb.h` | None |
-| **Rust** | `src/lib.rs` | Native crate | None |
-| **PHP / Ruby / Swift / Dart / Zig / etc.** | `include/squishdb.h` or `squishdb rpc` | C FFI or newline-delimited JSON-RPC over stdio | None |
+| Language | Binding Path | Mechanism | External Dependencies | CI Status |
+|---|---|---|---|---|
+| **Rust** | `src/lib.rs` | Native crate | None | CI-verified (Linux, Windows, macOS) |
+| **Python** | `bindings/python/` | In-process C FFI (`ctypes`) + PEP 249 DB-API 2.0 | None (stdlib only) | CI-verified (Linux, Windows, macOS) |
+| **TypeScript / JavaScript** (Node.js) | `bindings/typescript/` | Persistent `squishdb rpc` over stdio | None (Node >= 18) | CI-verified on Node.js 22 (Linux, Windows, macOS). Bun and Deno are experimental |
+| **Java** (JVM) | `bindings/java/` | In-process Java 22+ Foreign Function & Memory API | None (JDK 22+) | CI-verified on JDK 25 (Linux). Windows, macOS, and Kotlin are experimental |
+| **C# / .NET** | `bindings/csharp/` | In-process P/Invoke (`DllImport`) | None (.NET 8+) | CI-verified on .NET 8 (Linux). Windows and macOS are experimental |
+| **Go** | `bindings/go/` | In-process `cgo` against `include/squishdb.h` | None (stdlib + cgo) | CI-verified on Go 1.23 (Linux). Windows and macOS are experimental |
+| **C** | `include/squishdb.h` | Direct C99 header + shared/static lib | None | CI-verified (Linux). Windows and macOS are experimental |
+| **C++17** | `include/squishdb.hpp` | Header-only RAII wrapper over `squishdb.h` | None | CI-verified (Linux). Windows and macOS are experimental |
+| **PHP / Ruby / Swift / Dart / Zig / etc.** | `include/squishdb.h` or `squishdb rpc` | C FFI or newline-delimited JSON-RPC over stdio | None | Experimental (protocol tested via Rust RPC tests) |
 
 ---
 
